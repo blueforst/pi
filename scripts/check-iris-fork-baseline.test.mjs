@@ -350,6 +350,24 @@ test("rejects removed patch without commit ids", () => {
 	assertFailsWithFieldError(runCli(validLock(), patches), /firstForkCommit: required for status "removed"/);
 });
 
+test("rejects removable patch without commit ids", () => {
+	const patches = validPatches();
+	const patch = samplePatch();
+	patch.status = "removable";
+	delete patch.firstForkCommit;
+	patches.patches.push(patch);
+	assertFailsWithFieldError(runCli(validLock(), patches), /firstForkCommit: required for status "removable"/);
+});
+
+test("rejects upstreamed patch without commit ids", () => {
+	const patches = validPatches();
+	const patch = samplePatch();
+	patch.status = "upstreamed";
+	delete patch.latestForkCommit;
+	patches.patches.push(patch);
+	assertFailsWithFieldError(runCli(validLock(), patches), /latestForkCommit: required for status "upstreamed"/);
+});
+
 test("rejects missing fork object without throwing", () => {
 	const lock = validLock();
 	delete lock.fork;

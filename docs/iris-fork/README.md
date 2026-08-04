@@ -34,6 +34,7 @@
 - Historian、Compartment、Evidence、Publication；
 - Persona；
 - Goal & Work；
+- RuntimeRecoveryNotice；
 - Memory、Recall、Graphiti；
 - Iris 产品 DTO 或业务策略。
 
