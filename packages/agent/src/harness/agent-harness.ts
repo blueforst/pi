@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import {
 	type AssistantMessage,
 	contentText,
@@ -58,8 +57,11 @@ function createUserMessage(text: string, images?: ImageContent[]): UserMessage {
  * Deterministic content hash for a committed message entry (PI-016 receipt
  * attribution). Uses a stable key-sorted JSON serialization so identical
  * messages always produce identical hashes regardless of key order.
+ *
+ * Uses the global Web Crypto API (available in Node >=19 and browsers) so the
+ * harness keeps bundling for browser platforms (browser-smoke gate).
  */
-export function computeMessageContentHash(message: AgentMessage): string {
+export async function computeMessageContentHash(message: AgentMessage): Promise<string> {
 	const sorted = (value: unknown): unknown => {
 		if (Array.isArray(value)) return value.map(sorted);
 		if (value !== null && typeof value === "object") {
@@ -72,9 +74,9 @@ export function computeMessageContentHash(message: AgentMessage): string {
 		}
 		return value;
 	};
-	return createHash("sha256")
-		.update(JSON.stringify(sorted(message)))
-		.digest("hex");
+	const data = new TextEncoder().encode(JSON.stringify(sorted(message)));
+	const digest = await crypto.subtle.digest("SHA-256", data);
+	return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
 function createFailureMessage(model: Model<any>, error: unknown, aborted: boolean): AssistantMessage {
@@ -649,7 +651,7 @@ export class AgentHarness<
 			// PI-016/PI-017: emit the durable commit receipt + lifecycle event
 			// for the appended entry (exactly once per append).
 			const sessionMetadata = await this.session.getMetadata();
-			const contentHash = computeMessageContentHash(event.message);
+			const contentHash = await computeMessageContentHash(event.message);
 			await this.emitOwn(
 				{
 					type: "message_finalized",

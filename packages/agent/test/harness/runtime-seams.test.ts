@@ -152,13 +152,13 @@ describe("PI-016 Session commit receipts & PI-017 lifecycle events", () => {
 			content: [{ type: "text", text: "hello" }],
 			timestamp: 1234567890,
 		};
-		const hashA = computeMessageContentHash(stableMessage);
+		const hashA = await computeMessageContentHash(stableMessage);
 		const reorderedMessage: AgentMessage = {
 			timestamp: 1234567890,
 			content: [{ type: "text", text: "hello" }],
 			role: "user",
 		};
-		expect(computeMessageContentHash(reorderedMessage)).toBe(hashA);
+		expect(await computeMessageContentHash(reorderedMessage)).toBe(hashA);
 		expect(hashA.length).toBe(64);
 	});
 
