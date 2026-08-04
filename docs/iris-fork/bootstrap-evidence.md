@@ -115,6 +115,8 @@ OK: iris fork baseline manifests are valid
 ## 7. 已知限制与后续
 
 - 提交行为：本地 `npm ci --ignore-scripts` 未运行 husky 的 `prepare`，`.git/hooks/pre-commit` 未注册（`ls .git/hooks/` 仅 `.sample` 文件），因此本 commit 未被 pre-commit hook 拦截。`npm run check` 的实际结果见 §5.1（tsgo pre-existing 失败）。CI 不依赖 hooks：`.github/workflows/ci.yml` 直接运行 `npm run check`。
-- PR 目标 `blueforst/pi:main`；提交经过两个独立 subagent 审查（规格/边界 + 代码/测试/CI），审查记录写入 `docs/iris-fork/reviews/`。
+- PR 状态（2026-08-04）：PR #1 `R0-P0: controlled Pi fork provenance and CI baseline` 已创建（base `main`，head `iris/r0-p0-fork-baseline`，非 Draft）。
+- **CI 未触发**：GitHub 侧未在 `blueforst/pi` 调度任何 workflow run（`actions/workflows` API 返回 `total_count: 0`，`actions/runs` 返回 0；对照 `earendil-works/pi` 可正常列出 12 个 workflow）。远程 `main`（`ab5f8d8`）上 `.github/workflows/ci.yml` 存在且触发条件为 PR 到 main。结论：fork 的 Actions 配置（需 fork owner 在 GitHub Settings → Actions 启用 workflow 调度）导致 CI 未运行，与本 PR 内容无关；`actions/permissions` API 报 `enabled: true` 但不反映 workflow 级调度状态。
+- 后续：fork 落后 upstream 6 commits 需按 README §3 独立同步；tsgo pre-existing 类型漂移需解决后 `npm run check` 链才能全绿并在 CI 生效。
 - fork 落后状态需要在后续工作（独立于本 PR）按 README §3 流程处理。
 - 本机环境 Node v24.11.0（满足 engines `>=22.19.0`）；npm 警告 `Unknown project config "min-release-age"` 为仓库既有配置，非本任务引入。
