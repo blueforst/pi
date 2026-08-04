@@ -8,6 +8,7 @@ import {
 import { describe, expect, it } from "vitest";
 import { AgentHarness, computeMessageContentHash } from "../../src/harness/agent-harness.ts";
 import type { MessageFinalizedEvent } from "../../src/harness/types.ts";
+import type { AgentMessage } from "../../src/types.ts";
 import { calculateTool } from "../utils/calculate.ts";
 import { createInMemorySession } from "./session-test-utils.ts";
 
