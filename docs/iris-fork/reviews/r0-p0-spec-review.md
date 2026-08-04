@@ -1,42 +1,55 @@
-# R0-P0 规格与边界审查记录（Reviewer A）
+# R0-P0 规格与项目边界审查记录（Reviewer A）
+
+## 元信息
 
 - 审查日期：2026-08-04
-- 审查对象：`blueforst/pi` 分支 `iris/r0-p0-fork-baseline` 工作树（审查时未提交，最终以单个 commit 提交）
-- 审查者：独立 subagent（Reviewer A，规格与边界）
-- 审查文件：
-  - `docs/iris-fork/production-lock.json`
-  - `docs/iris-fork/carried-patches.json`
-  - `docs/iris-fork/README.md`
-  - `docs/iris-fork/bootstrap-evidence.md`
-  - `package.json`（check:iris-fork 接入）
-  - `.github/workflows/ci.yml`（CI 结论评估，未改动）
+- 审查对象：`blueforst/pi` 分支 `iris/r0-p0-fork-baseline`
+- **reviewedCommit**：`6e0cf571d6494cbd3f5c4b7f7d3c6a8fd0540385`（`fix(agent): correct fork governance and enforce provenance gate`，完整 diff 已由 reviewer 亲自查看）
+- **reReviewedCommit**：`a8d2eec21b1589c4d83d1efc493dd8108de24b37`（`fix(agent): align ownership list and cover remaining patch statuses`，review follow-up 复审）
+- 审查者：独立 subagent（Reviewer A，规格与项目边界）
+- 最高权威：Roadmap v13；三项目边界（Notion 07 Project Boundaries，2026-08-04 版，page 3aeb9833-8da5-8153-8ace-dc7ca9da57b9）；Pi Runtime Capsule Boundary（Notion 05，page 3a7b9833-8da5-8128-a4bb-fdb912063707）；Roadmap Detailed Specifications R0–R7（page 3b2b9833-8da5-81d0-ac5c-d0b997f38063）
 
-## 执行命令
+## Reviewed files
 
-- `node --test scripts/check-iris-fork-baseline.test.mjs` → 19 pass / 0 fail（初审时）
+- `.github/workflows/ci.yml`
+- `docs/iris-fork/README.md`
+- `scripts/check-iris-fork-baseline.mjs`
+- `scripts/check-iris-fork-baseline.test.mjs`
+
+## Executed commands
+
+- `git show 6e0cf571`（完整 diff）、`git show 6e0cf571 --stat`、`--name-only`
+- `git show a8d2eec2`（复审完整 diff）
+- `node --test scripts/check-iris-fork-baseline.test.mjs` → 38 pass / 0 fail（初审）；40 pass / 0 fail（复审后）
 - `npm run check:iris-fork` → `OK: iris fork baseline manifests are valid`
-- `git status --short` / `git diff --stat` / `git diff package.json` → 改动仅限任务文件
-- `git merge-base` / `rev-parse` / `log` / `rev-list` → 验证全部 SHA 与 divergence 声明
+
+## Actual outputs
+
+- 初审：`ℹ tests 38 / ℹ pass 38 / ℹ fail 0`；`OK: iris fork baseline manifests are valid`
+- 复审（a8d2eec2）：`ℹ tests 40 / ℹ pass 40 / ℹ fail 0`
 
 ## Findings
 
-### 规格符合性（全部通过，无 BLOCKING）
+### 初审（reviewedCommit 6e0cf571）
 
-- Manifest 16 个必填字段全部合规：三个 SHA（ab5f8d88… / e741cb05… / e741cb05…）均为 40 位 hex 且经 git 验证真实存在；无 TBD/TODO/unknown/零 SHA；日期 ISO；immutable upstream base 与 fork baseline 区分正确；package identity 诚实（8 个 workspace 包实测均为 `@earendil-works/pi-*` v0.83.0 → `inherits_upstream_package_names` + `not_published` 合理）。
-- carried-patches.json 空 `patches` 数组合法；`upstreamBaseCommit` 与 lock 交叉一致；README 明确空集语义。
-- README 覆盖全部五项规格：Ownership（禁止 Iris Context/P0–P5/Historian/Persona/Memory 等）、Sync procedure（fetch→inspect→checks→update lock→re-evaluate→remove satisfied→evidence）、Patch lifecycle、Release/package identity 诚实性、Evidence 要求。
-- evidence 关键事实（SHA、divergence = 6 upstream-only / 0 fork-only、commit 清单、19/19 测试、未实现清单、不宣称 R0 complete）全部经 git 实测复核一致。
-- 边界泄漏检查通过：改动仅 `M package.json` + `?? docs/` + 两个 scripts；无 Iris 专属层代码进入本仓库。
-- CI 结论成立：现有 ci.yml PR job 运行 `npm run check`（已含 check:iris-fork），无网络依赖，无需新 workflow。
+- **BLOCKING：无。**
+- PASS 依据：
+  1. README §1 Ownership 允许清单 11 项（AgentHarness/agent loop、provider/tool lifecycle、structured Provider Context Controller seam、SessionCommitReceipt、stable RuntimeEvent lifecycle seam、Session archive/sequenced reads/close/diagnostics、cache/rollback 性能、upstream compatibility 与通用 runtime tests）逐项对照 07 Project A 职责原文，均未被列为禁止；初版误禁 seam 已修正。
+  2. 禁止清单（P0–P5 policy、ContextMessageUnit、contextSeq ledger、IrisContextState、m0/m1/LKG、protected-tail/retirement/Historian disposition、Historian/Compartment/Evidence/Publication、Persona、Goal & Work、Memory/Recall/Graphiti、Iris 产品 DTO）与 07 Project A 禁止项及 05 页 Iris-owned 语义完全吻合；"seam vs seam 上运行的 Iris policy" 区分与 05 页 Decision Test 一致。
+  3. 无 Iris cognitive policy 泄漏进 Pi；无 Pi seam 误归属 iris_agent/iris_memory。
+  4. R0 范围诚实：无超出 R0-P0 的宣称。
+  5. 最小 diff：`--name-only` 仅 4 个文件。
+  6. CI gate step（ci.yml）位于 npm ci 之后、Build 之前，不被 tsgo 短路。
+- **NON-BLOCKING**：
+  - F1：bootstrap-evidence.md 相对本 commit 已过期（19/15 旧数字、CI 表述过时）——已在后续 docs commit 更新。
+  - F2：README 禁止清单未单列 RuntimeRecoveryNotice（07 页显式禁止项）——已修复，见复审。
+  - F3：schema v1 不变量与 commit identity 规则为仓库内部治理延伸，建议在 evidence 记录决策来源——已在 evidence §3 记录。
+  - F4：PR body 尚未更新——随后更新。
 
-### 修复项（初审 NON-BLOCKING → 已修复，复审通过）
+### 复审（reReviewedCommit a8d2eec2）
 
-- F7：evidence §5.1 错误码拆分（TS2345 ×655 等，744 总数）。
-- F8：evidence §5.2 内联 worktree 验证命令与输出。
-- F9：evidence §5.1 注明 biome 2.4.6 info 行来源（首次运行，未存档；npm ls 确认安装版本 2.3.5）。
-- F11：evidence §5.1/§5 补充说明 tsgo 短路导致 check:iris-fork 当前在 CI 实际执行不到。
-- F10（忽略）：`duration_ms` 运行时波动，非造假。
+- **BLOCKING：无。** F2 修复确认：README 禁止清单补列 RuntimeRecoveryNotice，与 07 Project Boundaries 禁止清单逐字对齐，位置顺序一致；附带 2 个测试（removable/upstreamed 缺 commit identity 拒绝）为一致性补强；改动仅 2 个文件。
 
-## 最终结论
+## Final verdict
 
-**VERDICT: PASS**（无 BLOCKING；初审与复审均通过）
+**PASS**（初审与复审均无 BLOCKING；reviewedCommit `6e0cf571`、reReviewedCommit `a8d2eec2` 均通过）
