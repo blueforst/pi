@@ -421,6 +421,11 @@ export class AgentHarness<
 
 	private async createTurnState(): Promise<AgentHarnessTurnState<TContext, TSkill, TPromptTemplate, TTool>> {
 		this.assertNotShutDown();
+		// PI-015: when no context controller is present, keep the EXACT native
+		// await order (Session.buildContext() first) so the default path stays
+		// byte-compatible. The controller path never forces buildContext().
+		const nativeContext =
+			this.contextController === undefined ? await this.session.buildContext() : undefined;
 		const resources = this.getResources();
 		const sessionMetadata = await this.session.getMetadata();
 		const toolContext = await this.resolveToolContext();
@@ -450,8 +455,7 @@ export class AgentHarness<
 			}
 		} else {
 			// Default native path: Session-derived context, byte-compatible.
-			const context = await this.session.buildContext();
-			messages = context.messages;
+			messages = nativeContext!.messages;
 			if (typeof this.systemPrompt === "string") {
 				systemPrompt = this.systemPrompt;
 			} else if (this.systemPrompt) {
@@ -676,7 +680,7 @@ export class AgentHarness<
 			await this.emitOwn({ type: "save_point", hadPendingMutations });
 			// PI-017: a full turn (assistant response + tool results) committed.
 			await this.emitOwn(
-				{ type: "turn_committed", messageCount: event.toolResults.length, hadPendingMutations },
+				{ type: "turn_committed", toolResultCount: event.toolResults.length, hadPendingMutations },
 				signal,
 			);
 			return;

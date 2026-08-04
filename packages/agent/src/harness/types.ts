@@ -761,7 +761,9 @@ export interface SessionCommitReceipt {
 /**
  * Stable lifecycle event: a message entry was finalized and durably appended
  * to the Session archive (PI-017). Fired for user, assistant and tool-result
- * messages alike, exactly once per appended entry.
+ * messages appended through the agent loop's message_end path, exactly once
+ * per appended entry. Entries appended directly via the Session API
+ * (harness.appendMessage / pending-writes flush) do not emit this event.
  */
 export interface MessageFinalizedEvent {
 	type: "message_finalized";
@@ -774,7 +776,8 @@ export interface MessageFinalizedEvent {
 /** Stable lifecycle event: a full turn (assistant response + its tool results) was committed (PI-017). */
 export interface TurnCommittedEvent {
 	type: "turn_committed";
-	messageCount: number;
+	/** Number of tool results committed in this turn (0 for a plain response turn). */
+	toolResultCount: number;
 	hadPendingMutations: boolean;
 }
 
