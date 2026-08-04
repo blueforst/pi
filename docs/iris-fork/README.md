@@ -5,23 +5,49 @@
 受约束的对象是 Iris Roadmap 的三个项目边界之一：**Pi Runtime Capsule**（runtime substrate）。
 另两个项目（`blueforst/iris_agent` cognitive runtime、`blueforst/iris_memory` memory service）不在本仓库治理范围内。
 
-## 1. Ownership：本仓库允许什么
+## 1. Ownership：blueforst/pi 的通用 Runtime seam 与禁止项
 
-`blueforst/pi` 是 **generic runtime substrate** 的载体。允许进入本仓库的内容：
+`blueforst/pi` 是 **generic runtime substrate** 的载体（Roadmap v13 三项目边界中的 Project A）。所有权划分以 Roadmap v13 与三项目边界（07 Project Boundaries，2026-08-04 版）为最高权威。
 
-- 通用 agent runtime 能力：模型接入、工具调用、会话管理、扩展机制、TUI、协议、存储等 pi 上游已有的能力演进。
-- 与上游 `earendil-works/pi` 的同步（见 §3）。
+### 允许并应由 `blueforst/pi` 实现（通用 runtime seam / lifecycle / substrate）
 
-**禁止进入本仓库的内容**（Iris 专属层，属于 `iris_agent` / `iris_memory` 边界）：
+- AgentHarness / agent loop；
+- provider lifecycle；
+- tool lifecycle；
+- structured pre-conversion Provider Context Controller seam；
+- stable RuntimeEvent lifecycle seam；
+- SessionCommitReceipt；
+- sequenced Session archive reads；
+- explicit Session close；
+- storage diagnostics；
+- rollback / cache / runtime performance；
+- upstream compatibility 与通用 runtime tests。
 
-- Iris Context（上下文构建、context routing、context compression 策略）
-- Iris P0–P5 能力分级的实现（如 Provider Context Controller、RuntimeEvent、SessionCommitReceipt、sequenced archive、explicit close 语义）
-- Historian（会话/记忆归档服务）
-- Persona（人格定义与渲染）
-- Memory（记忆读写与检索）
-- 任何以 "Iris" 命名的产品层逻辑
+### 禁止进入 `blueforst/pi`（Iris 认知或产品语义，属于 `iris_agent` / `iris_memory`）
 
-判断标准：某段代码是否依赖特定 agent 的认知语义（上下文、记忆、人格）？如果是，它属于 Iris 层，不得进入本仓库；即使"只是方便"，也必须放在 `iris_agent` 边界内。
+- Iris P0–P5 policy；
+- ContextMessageUnit；
+- contextSeq ledger；
+- identity-level IrisContextState；
+- m0/m1/LKG 的 Iris 策略；
+- protected-tail、retirement、Historian disposition 的 Iris 语义；
+- Historian、Compartment、Evidence、Publication；
+- Persona；
+- Goal & Work；
+- Memory、Recall、Graphiti；
+- Iris 产品 DTO 或业务策略。
+
+### 关键区别
+
+```text
+通用 seam / lifecycle / substrate
+→ blueforst/pi
+
+seam 上运行的 Iris cognitive policy
+→ blueforst/iris_agent
+```
+
+判断标准：某段代码描述的是**通用 runtime 机制**（回合如何执行、消息如何落盘、生命周期如何推进、provider/tool 如何被调用）？若是，归 `blueforst/pi`。它是否承载 **Iris 的认知/产品语义**（Context 策略、记忆、人格、工作目标、Historian 处置）？若是，归 `iris_agent` / `iris_memory`，即使"只是方便"也不得进入本仓库。RuntimeEvent 等 seam 本身是 Pi 的能力；在其上运行的 Iris policy 才是禁止项。
 
 ## 2. 基线（Baselines）
 
@@ -59,7 +85,8 @@
 `docs/iris-fork/carried-patches.json` 记录 fork 携带的、upstream 尚未有的变更。
 
 - **空 `patches` 数组表示"当前没有 fork-only patch"，不代表"没有治理要求"**。治理要求由本文档 + validator + `production-lock.json` 构成，与 patch 数量无关。
-- 每个 patch 必须完整填写 schema 字段（见 §6）：`id`、`title`、`status`、`genericRuntimeRationale`、`affectedPackages`、`affectedSurfaces`、`tests`、`upstream.*`、`firstForkCommit`/`latestForkCommit`（proposed 阶段可缺省）、`removalCondition`、`compatibilityRisk`、`notes`。
+- 每个 patch 必须完整填写 schema 字段（见 §6）：`id`、`title`、`status`、`genericRuntimeRationale`、`affectedPackages`、`affectedSurfaces`、`tests`、`upstream.*`、`firstForkCommit`/`latestForkCommit`、`removalCondition`、`compatibilityRisk`、`notes`。`id` 必须是非空字符串，空 id 被拒绝。
+- **Commit identity 规则**：`status = proposed` 时 `firstForkCommit`/`latestForkCommit` 可以缺省（提案尚未落地 fork commit）；`carried` / `upstreamed` / `removable` / `removed` 时两者**必须存在**且为完整非零 SHA。`removed` 的 `latestForkCommit` 表示移除该 patch 的 fork commit；移除操作必须先落 commit 再改状态，不允许"未提交的移除"。
 - `status` 枚举：`proposed`（提案中，尚无 fork commit）/ `carried`（正在携带）/ `upstreamed`（已贡献回上游）/ `removable`（可移除）/ `removed`（已移除）。
 - `upstream.status` 枚举：`not_filed`（未向上游提交 issue/PR，**未提交时必须用它**）/ `filed` / `open` / `merged` / `rejected` / `superseded`。当 `not_filed` 时，`upstream.issue` 与 `upstream.pullRequest` 必须为 `null`。
 - 新增 patch → 必须带 `tests`（数组，非空）与 `removalCondition`（非空字符串）。没有测试或没有移除条件的 patch 无法通过校验。
@@ -93,7 +120,7 @@
 
 ### Validator（fail-closed）
 
-`scripts/check-iris-fork-baseline.mjs` 是 schema 的单一权威实现，无第三方依赖，已接入 `npm run check`（`check:iris-fork`）与 PR CI。**失败即退出非零**，任何下列情况都会导致 CI 失败：
+`scripts/check-iris-fork-baseline.mjs` 是 schema 的单一权威实现，无第三方依赖。它有两个执行入口：root `npm run check` 链（`check:iris-fork`）以及 `.github/workflows/ci.yml` 中**独立且靠前的 "Iris fork provenance gate" step**（位于 build 与 full check 之前，不会被 `tsgo` 等既有失败短路）。**失败即退出非零**，任何下列情况都会导致 gate 失败：
 
 1. JSON 无法解析
 2. schemaVersion 不支持
@@ -103,13 +130,16 @@
 6. 零 SHA
 7. `fork.repository` / `upstream.repository` 不匹配（`blueforst/pi` / `earendil-works/pi`）
 8. 依赖方向错误（非 `upstream_only`）
-9. patch id 重复
+9. patch `id` 为空或重复
 10. patch `status` 不在枚举内
 11. patch `upstream.status` 不在枚举内
 12. patch 无 `tests`（缺失或空数组）
 13. patch 无 `removalCondition`（缺失或空）
 14. patch 的 `firstForkCommit` / `latestForkCommit` 存在但格式错误
-15. `carried-patches.json` 的 `upstreamBaseCommit` 与 lock 的 `upstream.baseCommit` 不一致
+15. 非 `proposed` 状态的 patch 缺少 `firstForkCommit` / `latestForkCommit`
+16. 父对象缺失或为 `null`（如 `fork`、`upstream` 缺失）时仍返回字段级错误，不崩溃
+17. 跨字段不变量（schema v1 固定规则）：`sync.lastVerifiedUpstreamCommit` 必须等于 `upstream.baseCommit`；`sync.lastVerifiedAt` 必须等于或晚于 `upstream.verifiedAt`；`fork.defaultBranch` 必须为 `main`；`runtime.packageManager` 必须为 `npm`；`runtime.lockfile` 必须为 `package-lock.json`
+18. `carried-patches.json` 的 `upstreamBaseCommit` 与 lock 的 `upstream.baseCommit` 不一致
 
 本地运行：`npm run check:iris-fork`，或带路径运行 `node scripts/check-iris-fork-baseline.mjs <lockPath> <patchesPath>`。
 

@@ -189,6 +189,35 @@ function checkNonEmptyStringArray(obj, path, label) {
 	return errors;
 }
 
+// Cross-field invariants for schema v1. Only checked when both values exist;
+// missing values are reported by the required-field checks instead.
+function checkLockInvariants(lock, label) {
+	const errors = [];
+	const defaultBranch = getPath(lock, "fork.defaultBranch");
+	if (defaultBranch !== undefined && defaultBranch !== "main") {
+		errors.push(`${label}: fork.defaultBranch: schema v1 requires "main", got ${JSON.stringify(defaultBranch)}`);
+	}
+	const packageManager = getPath(lock, "runtime.packageManager");
+	if (packageManager !== undefined && packageManager !== "npm") {
+		errors.push(`${label}: runtime.packageManager: schema v1 requires "npm", got ${JSON.stringify(packageManager)}`);
+	}
+	const lockfile = getPath(lock, "runtime.lockfile");
+	if (lockfile !== undefined && lockfile !== "package-lock.json") {
+		errors.push(`${label}: runtime.lockfile: schema v1 requires "package-lock.json", got ${JSON.stringify(lockfile)}`);
+	}
+	const upstreamBase = getPath(lock, "upstream.baseCommit");
+	const lastVerifiedUpstream = getPath(lock, "sync.lastVerifiedUpstreamCommit");
+	if (upstreamBase !== undefined && lastVerifiedUpstream !== undefined && lastVerifiedUpstream !== upstreamBase) {
+		errors.push(`${label}: sync.lastVerifiedUpstreamCommit must equal upstream.baseCommit, got ${JSON.stringify(lastVerifiedUpstream)} vs ${JSON.stringify(upstreamBase)}`);
+	}
+	const verifiedAt = getPath(lock, "upstream.verifiedAt");
+	const lastVerifiedAt = getPath(lock, "sync.lastVerifiedAt");
+	if (verifiedAt !== undefined && lastVerifiedAt !== undefined && lastVerifiedAt < verifiedAt) {
+		errors.push(`${label}: sync.lastVerifiedAt must be equal to or later than upstream.verifiedAt, got ${JSON.stringify(lastVerifiedAt)} vs ${JSON.stringify(verifiedAt)}`);
+	}
+	return errors;
+}
+
 export function validateProductionLock(lock, label = "production-lock.json") {
 	const errors = [];
 	if (!isObject(lock)) {
@@ -200,11 +229,11 @@ export function validateProductionLock(lock, label = "production-lock.json") {
 		errors.push(`${label}: schemaVersion: unsupported value ${JSON.stringify(lock.schemaVersion)}, expected ${SUPPORTED_SCHEMA_VERSION}`);
 	}
 	checkNonEmptyStringField(lock, "fork.defaultBranch", label).forEach((e) => errors.push(e));
-	if (lock.fork.repository !== FORK_REPOSITORY) {
-		errors.push(`${label}: fork.repository: expected ${FORK_REPOSITORY}, got ${JSON.stringify(lock.fork.repository)}`);
+	if (getPath(lock, "fork.repository") !== FORK_REPOSITORY) {
+		errors.push(`${label}: fork.repository: expected ${FORK_REPOSITORY}, got ${JSON.stringify(getPath(lock, "fork.repository"))}`);
 	}
-	if (lock.upstream.repository !== UPSTREAM_REPOSITORY) {
-		errors.push(`${label}: upstream.repository: expected ${UPSTREAM_REPOSITORY}, got ${JSON.stringify(lock.upstream.repository)}`);
+	if (getPath(lock, "upstream.repository") !== UPSTREAM_REPOSITORY) {
+		errors.push(`${label}: upstream.repository: expected ${UPSTREAM_REPOSITORY}, got ${JSON.stringify(getPath(lock, "upstream.repository"))}`);
 	}
 	errors.push(...checkShaField(lock, "fork.baselineCommit", label));
 	errors.push(...checkShaField(lock, "upstream.baseCommit", label));
@@ -216,6 +245,7 @@ export function validateProductionLock(lock, label = "production-lock.json") {
 	errors.push(...checkEnumField(lock, "distribution.publishStatus", PUBLISH_STATUSES, label));
 	errors.push(...checkEnumField(lock, "dependencyDirection", DEPENDENCY_DIRECTIONS, label));
 	errors.push(...checkEnumField(lock, "sync.strategy", SYNC_STRATEGIES, label));
+	errors.push(...checkLockInvariants(lock, label));
 	errors.push(...placeholderErrors(lock, label));
 	return errors;
 }
@@ -243,6 +273,8 @@ export function validateCarriedPatches(doc, label = "carried-patches.json") {
 			continue;
 		}
 		errors.push(...checkRequiredFields(patch, PATCH_REQUIRED_FIELDS, patchLabel));
+		checkNonEmptyStringField(patch, "id", patchLabel).forEach((e) => errors.push(e));
+		// Duplicate detection only applies once the id is known to be non-empty.
 		if (isNonEmptyString(patch.id)) {
 			if (seenIds.has(patch.id)) {
 				errors.push(`${patchLabel}: id: duplicate patch id: ${JSON.stringify(patch.id)}`);
@@ -264,11 +296,19 @@ export function validateCarriedPatches(doc, label = "carried-patches.json") {
 				errors.push(`${patchLabel}: ${path}: expected null or a positive integer, got ${JSON.stringify(value)}`);
 			}
 		}
-		if (patch.upstream && patch.upstream.status === "not_filed" && (patch.upstream.issue !== null || patch.upstream.pullRequest !== null)) {
+		const upstreamStatus = getPath(patch, "upstream.status");
+		if (upstreamStatus === "not_filed" && (getPath(patch, "upstream.issue") !== null || getPath(patch, "upstream.pullRequest") !== null)) {
 			errors.push(`${patchLabel}: upstream.status is "not_filed" but upstream.issue/upstream.pullRequest are not null`);
 		}
+		// Commit identity: only "proposed" may omit fork commit ids; every other
+		// status must point at real, non-zero fork commits.
+		const patchStatus = getPath(patch, "status");
+		const requiresCommitIdentity = patchStatus !== undefined && patchStatus !== "proposed";
 		for (const path of ["firstForkCommit", "latestForkCommit"]) {
-			if (getPath(patch, path) !== undefined) {
+			const value = getPath(patch, path);
+			if (requiresCommitIdentity && value === undefined) {
+				errors.push(`${patchLabel}: ${path}: required for status ${JSON.stringify(patchStatus)}; only "proposed" may omit commit identity`);
+			} else if (value !== undefined) {
 				errors.push(...checkShaField(patch, path, patchLabel));
 			}
 		}
@@ -280,9 +320,13 @@ export function validateCarriedPatches(doc, label = "carried-patches.json") {
 export function validateBaselineConsistency(lock, patchesDoc, lockLabel = "production-lock.json", patchesLabel = "carried-patches.json") {
 	const errors = [];
 	if (!isObject(lock) || !isObject(patchesDoc)) return errors;
-	if (patchesDoc.upstreamBaseCommit !== lock.upstream.baseCommit) {
+	const lockBase = getPath(lock, "upstream.baseCommit");
+	const patchesBase = getPath(patchesDoc, "upstreamBaseCommit");
+	// Missing values are reported by the per-manifest checks; only compare
+	// when both are present so partial documents never crash this pass.
+	if (lockBase !== undefined && patchesBase !== undefined && patchesBase !== lockBase) {
 		errors.push(
-			`${patchesLabel}: upstreamBaseCommit ${JSON.stringify(patchesDoc.upstreamBaseCommit)} does not match ${lockLabel}: upstream.baseCommit ${JSON.stringify(lock.upstream.baseCommit)}`
+			`${patchesLabel}: upstreamBaseCommit ${JSON.stringify(patchesBase)} does not match ${lockLabel}: upstream.baseCommit ${JSON.stringify(lockBase)}`
 		);
 	}
 	return errors;

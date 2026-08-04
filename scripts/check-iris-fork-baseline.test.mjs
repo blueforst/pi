@@ -94,6 +94,14 @@ function runCli(lock, patches) {
 	return { status: result.status, stdout: result.stdout, stderr: result.stderr };
 }
 
+// Fails with exit code 1, a field-level error matching `pattern`, and no
+// raw TypeError/stack trace leaking from the validator.
+function assertFailsWithFieldError(result, pattern) {
+	assert.equal(result.status, 1);
+	assert.match(result.stderr, pattern);
+	assert.doesNotMatch(result.stderr, /TypeError|\n\s+at /);
+}
+
 test("accepts valid empty manifests", () => {
 	const { status, stdout, stderr } = runCli(validLock(), validPatches());
 	assert.equal(status, 0);
@@ -101,7 +109,7 @@ test("accepts valid empty manifests", () => {
 	assert.equal(stderr, "");
 });
 
-test("accepts a valid carried patch", () => {
+test("accepts carried patch with valid commit ids", () => {
 	const patches = validPatches();
 	patches.patches.push(samplePatch());
 	const { status, stdout } = runCli(validLock(), patches);
@@ -282,6 +290,123 @@ test("rejects unparsable JSON", () => {
 	const result = spawnSync(process.execPath, [SCRIPT, lockPath, patchesPath], { encoding: "utf8" });
 	assert.equal(result.status, 1);
 	assert.match(result.stderr, /cannot read or parse/);
+});
+
+test("rejects empty patch id", () => {
+	const patches = validPatches();
+	const patch = samplePatch();
+	patch.id = "";
+	patches.patches.push(patch);
+	assertFailsWithFieldError(runCli(validLock(), patches), /patches\[0\]: id: expected non-empty string/);
+});
+
+test("rejects duplicate empty patch ids", () => {
+	const patches = validPatches();
+	const first = samplePatch();
+	first.id = "";
+	const second = samplePatch();
+	second.id = "";
+	patches.patches.push(first, second);
+	const { status, stderr } = runCli(validLock(), patches);
+	assert.equal(status, 1);
+	assert.match(stderr, /patches\[0\]: id: expected non-empty string/);
+	assert.match(stderr, /patches\[1\]: id: expected non-empty string/);
+});
+
+test("accepts proposed patch without commit ids", () => {
+	const patches = validPatches();
+	const patch = samplePatch();
+	patch.status = "proposed";
+	delete patch.firstForkCommit;
+	delete patch.latestForkCommit;
+	patches.patches.push(patch);
+	const { status } = runCli(validLock(), patches);
+	assert.equal(status, 0);
+});
+
+test("rejects carried patch without firstForkCommit", () => {
+	const patches = validPatches();
+	const patch = samplePatch();
+	delete patch.firstForkCommit;
+	patches.patches.push(patch);
+	assertFailsWithFieldError(runCli(validLock(), patches), /firstForkCommit: required for status "carried"/);
+});
+
+test("rejects carried patch without latestForkCommit", () => {
+	const patches = validPatches();
+	const patch = samplePatch();
+	delete patch.latestForkCommit;
+	patches.patches.push(patch);
+	assertFailsWithFieldError(runCli(validLock(), patches), /latestForkCommit: required for status "carried"/);
+});
+
+test("rejects removed patch without commit ids", () => {
+	const patches = validPatches();
+	const patch = samplePatch();
+	patch.status = "removed";
+	delete patch.firstForkCommit;
+	delete patch.latestForkCommit;
+	patches.patches.push(patch);
+	assertFailsWithFieldError(runCli(validLock(), patches), /firstForkCommit: required for status "removed"/);
+});
+
+test("rejects missing fork object without throwing", () => {
+	const lock = validLock();
+	delete lock.fork;
+	assertFailsWithFieldError(runCli(lock, validPatches()), /missing required field: fork\.repository/);
+});
+
+test("rejects missing upstream object without throwing", () => {
+	const lock = validLock();
+	delete lock.upstream;
+	assertFailsWithFieldError(runCli(lock, validPatches()), /missing required field: upstream\.repository/);
+});
+
+test("rejects null fork object without throwing", () => {
+	const lock = validLock();
+	lock.fork = null;
+	assertFailsWithFieldError(runCli(lock, validPatches()), /fork\.repository: expected blueforst\/pi, got undefined/);
+});
+
+test("rejects null upstream object without throwing", () => {
+	const lock = validLock();
+	lock.upstream = null;
+	assertFailsWithFieldError(runCli(lock, validPatches()), /upstream\.repository: expected earendil-works\/pi, got undefined/);
+});
+
+test("consistency validation handles missing upstream safely", () => {
+	const lock = { schemaVersion: 1 };
+	assertFailsWithFieldError(runCli(lock, validPatches()), /missing required field: fork\.repository/);
+});
+
+test("rejects lastVerifiedUpstreamCommit not equal to upstream base", () => {
+	const lock = validLock();
+	lock.sync.lastVerifiedUpstreamCommit = "a".repeat(40);
+	assertFailsWithFieldError(runCli(lock, validPatches()), /sync\.lastVerifiedUpstreamCommit must equal upstream\.baseCommit/);
+});
+
+test("rejects lastVerifiedAt earlier than upstream verifiedAt", () => {
+	const lock = validLock();
+	lock.sync.lastVerifiedAt = "2026-08-03";
+	assertFailsWithFieldError(runCli(lock, validPatches()), /sync\.lastVerifiedAt must be equal to or later than upstream\.verifiedAt/);
+});
+
+test("rejects defaultBranch other than main", () => {
+	const lock = validLock();
+	lock.fork.defaultBranch = "dev";
+	assertFailsWithFieldError(runCli(lock, validPatches()), /fork\.defaultBranch: schema v1 requires "main"/);
+});
+
+test("rejects packageManager other than npm", () => {
+	const lock = validLock();
+	lock.runtime.packageManager = "pnpm";
+	assertFailsWithFieldError(runCli(lock, validPatches()), /runtime\.packageManager: schema v1 requires "npm"/);
+});
+
+test("rejects lockfile other than package-lock.json", () => {
+	const lock = validLock();
+	lock.runtime.lockfile = "yarn.lock";
+	assertFailsWithFieldError(runCli(lock, validPatches()), /runtime\.lockfile: schema v1 requires "package-lock\.json"/);
 });
 
 test("validates the real manifests via default paths", () => {
