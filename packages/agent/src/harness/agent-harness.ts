@@ -658,6 +658,7 @@ export class AgentHarness<
 					entryId,
 					role: event.message.role,
 					contentHash,
+					message: event.message,
 					receipt: {
 						sessionId: sessionMetadata.id,
 						entryId,
