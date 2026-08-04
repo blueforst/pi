@@ -31,9 +31,13 @@ function newFaux(): FauxProviderHandle {
 }
 
 function textContent(message: AgentMessage): string {
-	if (typeof message.content === "string") return message.content;
-	return message.content
-		.filter((part) => part.type === "text")
+	if (!("content" in message)) return "";
+	const content = message.content;
+	if (typeof content === "string") return content;
+	return content
+		.filter(
+			(part): part is Extract<typeof part, { type: "text"; text: string }> => part.type === "text",
+		)
 		.map((part) => part.text)
 		.join("");
 }
