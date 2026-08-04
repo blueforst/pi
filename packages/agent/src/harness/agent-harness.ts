@@ -26,6 +26,7 @@ import { formatPromptTemplateInvocation } from "./prompt-templates.ts";
 import { formatSkillInvocation } from "./skills.ts";
 import type {
 	AbortResult,
+	AgentHarnessContextController,
 	AgentHarnessEvent,
 	AgentHarnessEventResultMap,
 	AgentHarnessOptions,
@@ -50,6 +51,32 @@ function createUserMessage(text: string, images?: ImageContent[]): UserMessage {
 	const content: Array<{ type: "text"; text: string } | ImageContent> = [{ type: "text", text }];
 	if (images) content.push(...images);
 	return { role: "user", content, timestamp: Date.now() };
+}
+
+/**
+ * Deterministic content hash for a committed message entry (PI-016 receipt
+ * attribution). Uses a stable key-sorted JSON serialization so identical
+ * messages always produce identical hashes regardless of key order.
+ *
+ * Uses the global Web Crypto API (available in Node >=19 and browsers) so the
+ * harness keeps bundling for browser platforms (browser-smoke gate).
+ */
+export async function computeMessageContentHash(message: AgentMessage): Promise<string> {
+	const sorted = (value: unknown): unknown => {
+		if (Array.isArray(value)) return value.map(sorted);
+		if (value !== null && typeof value === "object") {
+			const record = value as Record<string, unknown>;
+			return Object.fromEntries(
+				Object.keys(record)
+					.sort()
+					.map((key) => [key, sorted(record[key])]),
+			);
+		}
+		return value;
+	};
+	const data = new TextEncoder().encode(JSON.stringify(sorted(message)));
+	const digest = await crypto.subtle.digest("SHA-256", data);
+	return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
 function createFailureMessage(model: Model<any>, error: unknown, aborted: boolean): AssistantMessage {
@@ -187,6 +214,7 @@ export class AgentHarness<
 	private model: Model<any>;
 	private thinkingLevel: ThinkingLevel;
 	private systemPrompt: AgentHarnessSystemPrompt<TContext, TSkill, TPromptTemplate, TTool> | undefined;
+	private contextController: AgentHarnessContextController<TContext, TSkill, TPromptTemplate, TTool> | undefined;
 	private toolContext: AgentHarnessToolContextSource<TContext> | undefined;
 	private streamOptions: AgentHarnessStreamOptions;
 	private retry: RetryPolicy | undefined;
@@ -207,6 +235,7 @@ export class AgentHarness<
 		this.streamOptions = cloneStreamOptions(options.streamOptions);
 		this.retry = options.retry;
 		this.systemPrompt = options.systemPrompt;
+		this.contextController = options.contextController;
 		this.toolContext = options.toolContext;
 		this.validateUniqueNames(
 			(options.tools ?? []).map((tool) => tool.name),
@@ -394,7 +423,11 @@ export class AgentHarness<
 
 	private async createTurnState(): Promise<AgentHarnessTurnState<TContext, TSkill, TPromptTemplate, TTool>> {
 		this.assertNotShutDown();
-		const context = await this.session.buildContext();
+		// PI-015: when no context controller is present, keep the EXACT native
+		// await order (Session.buildContext() first) so the default path stays
+		// byte-compatible. The controller path never forces buildContext().
+		const nativeContext =
+			this.contextController === undefined ? await this.session.buildContext() : undefined;
 		const resources = this.getResources();
 		const sessionMetadata = await this.session.getMetadata();
 		const toolContext = await this.resolveToolContext();
@@ -403,19 +436,42 @@ export class AgentHarness<
 			.map((name) => this.tools.get(name))
 			.filter((tool): tool is TTool => tool !== undefined);
 		let systemPrompt = "You are a helpful assistant.";
-		if (typeof this.systemPrompt === "string") {
-			systemPrompt = this.systemPrompt;
-		} else if (this.systemPrompt) {
-			systemPrompt = await this.systemPrompt({
+		let messages: AgentMessage[];
+		if (this.contextController !== undefined) {
+			// PI-015: Provider Context Controller decides systemPrompt/messages
+			// completely BEFORE provider conversion; Session.buildContext() is
+			// NOT forced on this path.
+			const controlled = await this.contextController({
 				session: this.session,
 				model: this.model,
 				thinkingLevel: this.thinkingLevel,
 				activeTools,
 				resources,
 			});
+			systemPrompt = controlled.systemPrompt;
+			messages = controlled.messages;
+			if (controlled.activeToolNames !== undefined) {
+				this.validateUniqueNames(controlled.activeToolNames, "Duplicate active tool name(s)");
+				this.validateToolNames(controlled.activeToolNames);
+				this.activeToolNames = [...controlled.activeToolNames];
+			}
+		} else {
+			// Default native path: Session-derived context, byte-compatible.
+			messages = nativeContext!.messages;
+			if (typeof this.systemPrompt === "string") {
+				systemPrompt = this.systemPrompt;
+			} else if (this.systemPrompt) {
+				systemPrompt = await this.systemPrompt({
+					session: this.session,
+					model: this.model,
+					thinkingLevel: this.thinkingLevel,
+					activeTools,
+					resources,
+				});
+			}
 		}
 		return {
-			messages: context.messages,
+			messages,
 			resources,
 			toolContext,
 			streamOptions: cloneStreamOptions(this.streamOptions),
@@ -514,6 +570,17 @@ export class AgentHarness<
 					isError,
 					usage: result.usage,
 				});
+				// PI-017: tool execution committed with its result.
+				await this.emitOwn(
+					{
+						type: "tool_execution_committed",
+						toolCallId: toolCall.id,
+						toolName: toolCall.name,
+						input: args as Record<string, unknown>,
+						isError: patch ? (patch.isError ?? isError) : isError,
+					},
+					this.activeAbortController?.signal,
+				);
 				return patch
 					? {
 							content: patch.content,
@@ -579,8 +646,27 @@ export class AgentHarness<
 
 	private async handleAgentEvent(event: AgentEvent, signal?: AbortSignal): Promise<void> {
 		if (event.type === "message_end") {
-			await this.session.appendMessage(event.message);
+			const entryId = await this.session.appendMessage(event.message);
 			await this.emitAny(event, signal);
+			// PI-016/PI-017: emit the durable commit receipt + lifecycle event
+			// for the appended entry (exactly once per append).
+			const sessionMetadata = await this.session.getMetadata();
+			const contentHash = await computeMessageContentHash(event.message);
+			await this.emitOwn(
+				{
+					type: "message_finalized",
+					entryId,
+					role: event.message.role,
+					contentHash,
+					receipt: {
+						sessionId: sessionMetadata.id,
+						entryId,
+						contentHash,
+						committedAt: new Date().toISOString(),
+					},
+				},
+				signal,
+			);
 			return;
 		}
 		if (event.type === "turn_end") {
@@ -594,6 +680,11 @@ export class AgentHarness<
 			await this.flushPendingSessionWrites();
 			if (eventError) throw eventError;
 			await this.emitOwn({ type: "save_point", hadPendingMutations });
+			// PI-017: a full turn (assistant response + tool results) committed.
+			await this.emitOwn(
+				{ type: "turn_committed", toolResultCount: event.toolResults.length, hadPendingMutations },
+				signal,
+			);
 			return;
 		}
 		if (event.type === "agent_end") {
