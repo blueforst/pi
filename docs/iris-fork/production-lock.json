@@ -1,0 +1,28 @@
+{
+	"schemaVersion": 1,
+	"fork": {
+		"repository": "blueforst/pi",
+		"defaultBranch": "main",
+		"baselineCommit": "ab5f8d88ee1d400c0c8fb5c50ac10b2f4a4851d1"
+	},
+	"upstream": {
+		"repository": "earendil-works/pi",
+		"baseCommit": "e741cb05ca7c1c7bc5a9664c99697df32de9fac6",
+		"verifiedAt": "2026-08-04"
+	},
+	"runtime": {
+		"node": ">=22.19.0",
+		"packageManager": "npm",
+		"lockfile": "package-lock.json"
+	},
+	"distribution": {
+		"packageIdentityStatus": "inherits_upstream_package_names",
+		"publishStatus": "not_published"
+	},
+	"dependencyDirection": "upstream_only",
+	"sync": {
+		"strategy": "manual_review_gate",
+		"lastVerifiedUpstreamCommit": "e741cb05ca7c1c7bc5a9664c99697df32de9fac6",
+		"lastVerifiedAt": "2026-08-04"
+	}
+}
