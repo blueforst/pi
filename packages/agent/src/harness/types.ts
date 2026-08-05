@@ -761,9 +761,10 @@ export interface SessionCommitReceipt {
 /**
  * Stable lifecycle event: a message entry was finalized and durably appended
  * to the Session archive (PI-017). Fired for user, assistant and tool-result
- * messages appended through the agent loop's message_end path, exactly once
- * per appended entry. Entries appended directly via the Session API
- * (harness.appendMessage / pending-writes flush) do not emit this event.
+ * messages appended through the agent loop's message_end path, direct
+ * harness.appendMessage calls, and pending-writes flush, exactly once per
+ * durable append (iris_agent#40). All supported append paths share one commit
+ * primitive so no valid append can bypass commit evidence.
  */
 export interface MessageFinalizedEvent {
 	type: "message_finalized";
