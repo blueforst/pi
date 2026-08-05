@@ -5,7 +5,9 @@
 		{
 			"id": "PI-015-provider-context-controller",
 			"title": "Provider Context Controller seam before provider conversion",
-			"status": "proposed",
+			"status": "carried",
+			"firstForkCommit": "310e73313cd836cde4014085577a3e46a757192c",
+			"latestForkCommit": "e65e26bd2893895941ecf130e6c5a731b43e2b4b",
 			"genericRuntimeRationale": "Any agent runtime consumer needs to decide systemPrompt/messages/tools completely before provider conversion without forcing Session.buildContext() (e.g. identity-level Context engines that do not derive messages from the Session archive). The default native Session-derived path is unchanged and byte-compatible when the controller is absent.",
 			"affectedPackages": ["@earendil-works/pi-agent-core"],
 			"affectedSurfaces": ["AgentHarness options", "createTurnState", "provider request composition"],
@@ -25,7 +27,9 @@
 		{
 			"id": "PI-016-session-commit-receipt",
 			"title": "Awaited Session commit receipts for appended entries",
-			"status": "proposed",
+			"status": "carried",
+			"firstForkCommit": "310e73313cd836cde4014085577a3e46a757192c",
+			"latestForkCommit": "e65e26bd2893895941ecf130e6c5a731b43e2b4b",
 			"genericRuntimeRationale": "Consumers of the Session archive need awaited, durable commit evidence (sessionId, entryId, content hash, optional entrySeq) to attribute messages exactly once and to reconcile crash windows; observer-only events cannot prove durability. Receipts are carried on the new message_finalized lifecycle event; the Session append API itself keeps its existing return contract.",
 			"affectedPackages": ["@earendil-works/pi-agent-core"],
 			"affectedSurfaces": ["SessionCommitReceipt type", "message_finalized OwnEvent", "content hash computation"],
@@ -40,12 +44,14 @@
 			},
 			"removalCondition": "earendil-works/pi provides awaited append receipts (or an equivalent durability contract) and iris_agent consumes the released contract.",
 			"compatibilityRisk": "low: new additive event; no existing event or API shape is modified.",
-			"notes": "entrySeq is optional because the in-memory Session abstraction does not expose the storage-layer sequence; storage backends may fill it in later."
+			"notes": "entrySeq is optional because the in-memory Session abstraction does not expose the storage-layer sequence; storage backends may fill it in later. 0.83.1: message_finalized now also carries the committed message (commit evidence completeness)."
 		},
 		{
 			"id": "PI-017-runtime-event-lifecycle",
 			"title": "Stable runtime lifecycle events (message finalized / turn committed / tool execution committed)",
-			"status": "proposed",
+			"status": "carried",
+			"firstForkCommit": "310e73313cd836cde4014085577a3e46a757192c",
+			"latestForkCommit": "e65e26bd2893895941ecf130e6c5a731b43e2b4b",
 			"genericRuntimeRationale": "A generic agent runtime needs stable lifecycle events distinguishing message finalization, tool execution commit and turn commit from observer-level stream updates, so consumers can order user/tool/assistant boundaries and prove exactly-once attribution without scanning the Session archive.",
 			"affectedPackages": ["@earendil-works/pi-agent-core"],
 			"affectedSurfaces": ["AgentHarnessOwnEvent union", "handleAgentEvent", "afterToolCall"],

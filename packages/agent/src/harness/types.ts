@@ -770,6 +770,8 @@ export interface MessageFinalizedEvent {
 	entryId: string;
 	role: AgentMessage["role"];
 	contentHash: string;
+	/** 被提交条目的消息内容（commit 证据完整化，0.83.1）。 */
+	message: AgentMessage;
 	receipt: SessionCommitReceipt;
 }
 
