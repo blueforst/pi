@@ -7,11 +7,11 @@
 	},
 	"acceptedRuntime": {
 		"repository": "blueforst/pi",
-		"commit": "fa7aba0a5240ead1679dced5a5e12a0fe7df2800",
-		"tree": "1b43382f421da75ee20a78d3bf2ef4342e776bf6",
+		"commit": "91bfa59ac45a7f02dbcb64d872c47ab93793d26e",
+		"tree": "44d64fecd9ec8d6623d93dc49715da6476db9b1f",
 		"verifiedAt": "2026-08-05",
-		"equivalentCommit": "e18f7dd1457ea4a5987b4d44d0c41e0dfa48cedd",
-		"notes": "fa7aba0a is the accepted fork main head after the review PR chain. Its tree is byte-identical to the previously pinned seam commit e18f7dd (same git tree hash), so consumers may migrate from e18f7dd to fa7aba0a without a semantic change. acceptedRuntime is the single authoritative identity for the Pi runtime iris_agent is allowed to consume; floating main is never an accepted identity."
+		"equivalentCommit": "fa7aba0a5240ead1679dced5a5e12a0fe7df2800",
+		"notes": "91bfa59a is the accepted fork head containing the iris_agent#41 production-lock fix chain. Its tree is the immutable identity consumers must verify (git rev-parse 91bfa59a^{tree}). The previously pinned seam commit e18f7dd and the prior fork main fa7aba0a share the tree 1b43382f...; the fix chain changes the manifest tree, so the accepted identity now covers the fixed lock surface itself. acceptedRuntime is the single authoritative identity for the Pi runtime iris_agent is allowed to consume; floating main is never an accepted identity."
 	},
 	"upstream": {
 		"repository": "earendil-works/pi",
