@@ -426,8 +426,7 @@ export class AgentHarness<
 		// PI-015: when no context controller is present, keep the EXACT native
 		// await order (Session.buildContext() first) so the default path stays
 		// byte-compatible. The controller path never forces buildContext().
-		const nativeContext =
-			this.contextController === undefined ? await this.session.buildContext() : undefined;
+		const nativeContext = this.contextController === undefined ? await this.session.buildContext() : undefined;
 		const resources = this.getResources();
 		const sessionMetadata = await this.session.getMetadata();
 		const toolContext = await this.resolveToolContext();
