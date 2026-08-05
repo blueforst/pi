@@ -1,0 +1,73 @@
+{
+	"schemaVersion": 1,
+	"upstreamBaseCommit": "e741cb05ca7c1c7bc5a9664c99697df32de9fac6",
+	"patches": [
+		{
+			"id": "PI-015-provider-context-controller",
+			"title": "Provider Context Controller seam before provider conversion",
+			"status": "carried",
+			"firstForkCommit": "310e73313cd836cde4014085577a3e46a757192c",
+			"latestForkCommit": "e65e26bd2893895941ecf130e6c5a731b43e2b4b",
+			"genericRuntimeRationale": "Any agent runtime consumer needs to decide systemPrompt/messages/tools completely before provider conversion without forcing Session.buildContext() (e.g. identity-level Context engines that do not derive messages from the Session archive). The default native Session-derived path is unchanged and byte-compatible when the controller is absent.",
+			"affectedPackages": ["@earendil-works/pi-agent-core"],
+			"affectedSurfaces": ["AgentHarness options", "createTurnState", "provider request composition"],
+			"tests": [
+				"packages/agent/test/harness/runtime-seams.test.ts (PI-015 controller path skips buildContext; provider receives controller systemPrompt/messages)",
+				"packages/agent/test/harness/runtime-seams.test.ts (PI-015 default path still calls buildContext and stays compatible)"
+			],
+			"upstream": {
+				"status": "not_filed",
+				"issue": null,
+				"pullRequest": null
+			},
+			"removalCondition": "earendil-works/pi merges an equivalent pre-conversion context override seam and iris_agent rebases onto the released package containing it.",
+			"compatibilityRisk": "low: additive optional option; absent controller keeps the exact native code path.",
+			"notes": "Generic runtime seam; Iris cognitive policy (m0/m1/LKG, ContextMessageUnit) stays in iris_agent and is NOT part of this patch."
+		},
+		{
+			"id": "PI-016-session-commit-receipt",
+			"title": "Awaited Session commit receipts for appended entries",
+			"status": "carried",
+			"firstForkCommit": "310e73313cd836cde4014085577a3e46a757192c",
+			"latestForkCommit": "e65e26bd2893895941ecf130e6c5a731b43e2b4b",
+			"genericRuntimeRationale": "Consumers of the Session archive need awaited, durable commit evidence (sessionId, entryId, content hash, optional entrySeq) to attribute messages exactly once and to reconcile crash windows; observer-only events cannot prove durability. Receipts are carried on the new message_finalized lifecycle event; the Session append API itself keeps its existing return contract.",
+			"affectedPackages": ["@earendil-works/pi-agent-core"],
+			"affectedSurfaces": ["SessionCommitReceipt type", "message_finalized OwnEvent", "content hash computation"],
+			"tests": [
+				"packages/agent/test/harness/runtime-seams.test.ts (message_finalized carries a full receipt for every appended message)",
+				"packages/agent/test/harness/runtime-seams.test.ts (deterministic content hash via exported computeMessageContentHash)"
+			],
+			"upstream": {
+				"status": "not_filed",
+				"issue": null,
+				"pullRequest": null
+			},
+			"removalCondition": "earendil-works/pi provides awaited append receipts (or an equivalent durability contract) and iris_agent consumes the released contract.",
+			"compatibilityRisk": "low: new additive event; no existing event or API shape is modified.",
+			"notes": "entrySeq is optional because the in-memory Session abstraction does not expose the storage-layer sequence; storage backends may fill it in later. 0.83.1: message_finalized now also carries the committed message (commit evidence completeness)."
+		},
+		{
+			"id": "PI-017-runtime-event-lifecycle",
+			"title": "Stable runtime lifecycle events (message finalized / turn committed / tool execution committed)",
+			"status": "carried",
+			"firstForkCommit": "310e73313cd836cde4014085577a3e46a757192c",
+			"latestForkCommit": "e65e26bd2893895941ecf130e6c5a731b43e2b4b",
+			"genericRuntimeRationale": "A generic agent runtime needs stable lifecycle events distinguishing message finalization, tool execution commit and turn commit from observer-level stream updates, so consumers can order user/tool/assistant boundaries and prove exactly-once attribution without scanning the Session archive.",
+			"affectedPackages": ["@earendil-works/pi-agent-core"],
+			"affectedSurfaces": ["AgentHarnessOwnEvent union", "handleAgentEvent", "afterToolCall"],
+			"tests": [
+				"packages/agent/test/harness/runtime-seams.test.ts (message_finalized per appended message)",
+				"packages/agent/test/harness/runtime-seams.test.ts (turn_committed and settled in stable order)",
+				"packages/agent/test/harness/runtime-seams.test.ts (tool_execution_committed per executed tool call)"
+			],
+			"upstream": {
+				"status": "not_filed",
+				"issue": null,
+				"pullRequest": null
+			},
+			"removalCondition": "earendil-works/pi emits equivalent lifecycle events and iris_agent consumes the released contract.",
+			"compatibilityRisk": "low: additive events only; no existing event payload is changed.",
+			"notes": "settled/save_point/abort events already existed and are reused; the new events add the missing commit granularity."
+		}
+	]
+}
