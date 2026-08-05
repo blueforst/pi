@@ -106,8 +106,13 @@ seam 上运行的 Iris cognitive policy
 
 机器可验证的生产锁，字段：
 
-- `schemaVersion`：当前为 `1`。
+- `schemaVersion`：当前为 `2`。v2 新增 `acceptedRuntime` 段（见下）。
 - `fork.repository` / `fork.defaultBranch` / `fork.baselineCommit`：fork 身份与基线（完整 40 位 SHA，禁止零 SHA、占位符、浮动引用）。
+- `acceptedRuntime.repository` / `acceptedRuntime.commit` / `acceptedRuntime.tree` / `acceptedRuntime.verifiedAt`：**Agent 实际允许消费的 accepted runtime 身份**（issue iris_agent#41 单一权威来源）。
+  - `commit` 是 fork 内**不可变 commit**（经审查接受的 Pi fork head，如 `fa7aba0a…`）；
+  - `tree` 是该 commit 的 git tree hash（`<commit>^{tree}`），用于机械证明 checkout 内容等价；
+  - 禁止使用浮动 `main` 作为 accepted identity；`commit` 必须与 `fork.baselineCommit` 不同（仅记录初始 bootstrap 基线不满足 R0 Exit Gate）；
+  - `--verify-git` 模式会在真实 git 仓库中验证 commit 存在、tree 匹配、carried patches 是 accepted commit 的祖先。
 - `upstream.repository` / `upstream.baseCommit` / `upstream.verifiedAt`：immutable upstream 基线与其验证日期（ISO `YYYY-MM-DD`）。
 - `runtime.node` / `runtime.packageManager` / `runtime.lockfile`：运行时约束。
 - `distribution.packageIdentityStatus`：`inherits_upstream_package_names` 或 `independent_identity`。
@@ -121,7 +126,7 @@ seam 上运行的 Iris cognitive policy
 
 ### Validator（fail-closed）
 
-`scripts/check-iris-fork-baseline.mjs` 是 schema 的单一权威实现，无第三方依赖。它有两个执行入口：root `npm run check` 链（`check:iris-fork`）以及 `.github/workflows/ci.yml` 中**独立且靠前的 "Iris fork provenance gate" step**（位于 build 与 full check 之前，不会被 `tsgo` 等既有失败短路）。**失败即退出非零**，任何下列情况都会导致 gate 失败：
+`scripts/check-iris-fork-baseline.mjs` 是 schema 的单一权威实现，无第三方依赖。它有两个执行入口：root `npm run check` 链（`check:iris-fork`，带 `--verify-git`）以及 `.github/workflows/ci.yml` 中**独立且靠前的 "Iris fork provenance gate" step**（位于 build 与 full check 之前，不会被 `tsgo` 等既有失败短路）。**失败即退出非零**，任何下列情况都会导致 gate 失败：
 
 1. JSON 无法解析
 2. schemaVersion 不支持
@@ -130,19 +135,39 @@ seam 上运行的 Iris cognitive policy
 5. SHA 格式错误（非 40 位 hex）
 6. 零 SHA
 7. `fork.repository` / `upstream.repository` 不匹配（`blueforst/pi` / `earendil-works/pi`）
-8. 依赖方向错误（非 `upstream_only`）
-9. patch `id` 为空或重复
-10. patch `status` 不在枚举内
-11. patch `upstream.status` 不在枚举内
-12. patch 无 `tests`（缺失或空数组）
-13. patch 无 `removalCondition`（缺失或空）
-14. patch 的 `firstForkCommit` / `latestForkCommit` 存在但格式错误
-15. 非 `proposed` 状态的 patch 缺少 `firstForkCommit` / `latestForkCommit`
-16. 父对象缺失或为 `null`（如 `fork`、`upstream` 缺失）时仍返回字段级错误，不崩溃
-17. 跨字段不变量（schema v1 固定规则）：`sync.lastVerifiedUpstreamCommit` 必须等于 `upstream.baseCommit`；`sync.lastVerifiedAt` 必须等于或晚于 `upstream.verifiedAt`；`fork.defaultBranch` 必须为 `main`；`runtime.packageManager` 必须为 `npm`；`runtime.lockfile` 必须为 `package-lock.json`
-18. `carried-patches.json` 的 `upstreamBaseCommit` 与 lock 的 `upstream.baseCommit` 不一致
+8. `acceptedRuntime.repository` 不匹配、`acceptedRuntime.commit`/`tree` 缺失或格式错误、`acceptedRuntime.commit` 等于 `fork.baselineCommit`
+9. 依赖方向错误（非 `upstream_only`）
+10. patch `id` 为空或重复
+11. patch `status` 不在枚举内
+12. patch `upstream.status` 不在枚举内
+13. patch 无 `tests`（缺失或空数组）
+14. patch 无 `removalCondition`（缺失或空）
+15. patch 的 `firstForkCommit` / `latestForkCommit` 存在但格式错误
+16. 非 `proposed` 状态的 patch 缺少 `firstForkCommit` / `latestForkCommit`
+17. 父对象缺失或为 `null`（如 `fork`、`upstream` 缺失）时仍返回字段级错误，不崩溃
+18. 跨字段不变量（schema v2 固定规则）：`sync.lastVerifiedUpstreamCommit` 必须等于 `upstream.baseCommit`；`sync.lastVerifiedAt` 必须等于或晚于 `upstream.verifiedAt`；`fork.defaultBranch` 必须为 `main`；`runtime.packageManager` 必须为 `npm`；`runtime.lockfile` 必须为 `package-lock.json`
+19. `carried-patches.json` 的 `upstreamBaseCommit` 与 lock 的 `upstream.baseCommit` 不一致
+20. `--verify-git` 模式（`npm run check:iris-fork` 与 CI gate 默认启用）：acceptedRuntime.commit 在 git 仓库中不存在、`<commit>^{tree}` 与 lock 记录的 tree 不一致、或任一 `carried`/`upstreamed`/`removable`/`removed` patch 的 `latestForkCommit` 不是 acceptedRuntime.commit 的祖先
 
-本地运行：`npm run check:iris-fork`，或带路径运行 `node scripts/check-iris-fork-baseline.mjs <lockPath> <patchesPath>`。
+本地运行：`npm run check:iris-fork`，或带路径运行 `node scripts/check-iris-fork-baseline.mjs [--verify-git] <lockPath> <patchesPath> [repoDir]`。
+
+### 开发者本地 bootstrap（不触碰已有分支）
+
+`blueforst/pi` 的 accepted runtime 身份是**不可变 commit + tree**。开发者无需把个人工作分支 reset 到 accepted commit；推荐在独立目录使用 worktree/clone 固定到 accepted identity：
+
+```bash
+# 在仓库外（例如 workspace/pi-accepted）创建只读 detached checkout，绝不移动现有分支
+git clone --no-checkout https://github.com/blueforst/pi.git /tmp/pi-accepted
+git -C /tmp/pi-accepted fetch origin fa7aba0a5240ead1679dced5a5e12a0fe7df2800
+git -C /tmp/pi-accepted checkout --detach fa7aba0a5240ead1679dced5a5e12a0fe7df2800
+git -C /tmp/pi-accepted rev-parse HEAD^{tree}   # 必须等于 1b43382f…
+node /path/to/pi/scripts/check-iris-fork-baseline.mjs --verify-git \
+  /path/to/pi/docs/iris-fork/production-lock.json \
+  /path/to/pi/docs/iris-fork/carried-patches.json \
+  /tmp/pi-accepted
+```
+
+对 `iris_agent` 消费方（相邻 `../pi` 布局），`iris_agent` 仓库提供等效的确定性 bootstrap 脚本（见 `iris_agent/docs/pi-production-lock.md`），其行为与上面等价：fetch 期望仓库 → 校验 commit/tree → 在专用目录创建 detached worktree/checkout → 不 reset 任何已有分支 → 不匹配时输出可操作的诊断。
 
 ## 7. Evidence 要求
 

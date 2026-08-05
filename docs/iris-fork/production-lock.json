@@ -1,9 +1,17 @@
 {
-	"schemaVersion": 1,
+	"schemaVersion": 2,
 	"fork": {
 		"repository": "blueforst/pi",
 		"defaultBranch": "main",
 		"baselineCommit": "ab5f8d88ee1d400c0c8fb5c50ac10b2f4a4851d1"
+	},
+	"acceptedRuntime": {
+		"repository": "blueforst/pi",
+		"commit": "fa7aba0a5240ead1679dced5a5e12a0fe7df2800",
+		"tree": "1b43382f421da75ee20a78d3bf2ef4342e776bf6",
+		"verifiedAt": "2026-08-05",
+		"equivalentCommit": "e18f7dd1457ea4a5987b4d44d0c41e0dfa48cedd",
+		"notes": "fa7aba0a is the accepted fork main head after the review PR chain. Its tree is byte-identical to the previously pinned seam commit e18f7dd (same git tree hash), so consumers may migrate from e18f7dd to fa7aba0a without a semantic change. acceptedRuntime is the single authoritative identity for the Pi runtime iris_agent is allowed to consume; floating main is never an accepted identity."
 	},
 	"upstream": {
 		"repository": "earendil-works/pi",
