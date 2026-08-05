@@ -34,14 +34,13 @@ jobs:
 
       # Iris fork provenance gate runs before build/full check so it cannot be
       # short-circuited by pre-existing failures further down the check chain.
-      # The gate verifies acceptedRuntime.commit/tree in the local object store;
-      # a shallow PR checkout may not contain that commit yet, so fetch it
-      # explicitly from the production-lock.json value (never a floating ref).
-      - name: Fetch accepted runtime commit for provenance gate
-        run: |
-          ACCEPTED=$(node -e "console.log(require('./docs/iris-fork/production-lock.json').acceptedRuntime.commit)")
-          git fetch origin "$ACCEPTED" --depth=1
-          git rev-parse "$ACCEPTED^{tree}"
+      # The gate verifies acceptedRuntime.commit/tree in the local object store
+      # and checks carried-patch commits are ancestors of the accepted commit.
+      # A shallow PR checkout contains neither, so unshallow the history first
+      # (never a floating ref: the gate still verifies against the immutable
+      # values in production-lock.json).
+      - name: Fetch full history for provenance gate
+        run: git fetch --unshallow --tags origin
 
       - name: Iris fork provenance gate
         run: npm run check:iris-fork
