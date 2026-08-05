@@ -742,6 +742,79 @@ export interface ResourcesUpdateEvent<
 	previousResources: AgentHarnessResources<TSkill, TPromptTemplate>;
 }
 
+/**
+ * Awaited commit receipt for a durable Session entry (PI-016).
+ *
+ * Emitted together with {@link MessageFinalizedEvent} after the entry has been
+ * durably appended to the Session archive. `entrySeq` is optional because the
+ * in-memory Session abstraction does not expose the storage-layer sequence;
+ * storage backends that provide one (e.g. sqlite-node) can fill it in.
+ */
+export interface SessionCommitReceipt {
+	sessionId: string;
+	entryId: string;
+	entrySeq?: number;
+	contentHash: string;
+	committedAt: string;
+}
+
+/**
+ * Stable lifecycle event: a message entry was finalized and durably appended
+ * to the Session archive (PI-017). Fired for user, assistant and tool-result
+ * messages appended through the agent loop's message_end path, exactly once
+ * per appended entry. Entries appended directly via the Session API
+ * (harness.appendMessage / pending-writes flush) do not emit this event.
+ */
+export interface MessageFinalizedEvent {
+	type: "message_finalized";
+	entryId: string;
+	role: AgentMessage["role"];
+	contentHash: string;
+	receipt: SessionCommitReceipt;
+}
+
+/** Stable lifecycle event: a full turn (assistant response + its tool results) was committed (PI-017). */
+export interface TurnCommittedEvent {
+	type: "turn_committed";
+	/** Number of tool results committed in this turn (0 for a plain response turn). */
+	toolResultCount: number;
+	hadPendingMutations: boolean;
+}
+
+/** Stable lifecycle event: a tool execution was committed with its result (PI-017). */
+export interface ToolExecutionCommittedEvent {
+	type: "tool_execution_committed";
+	toolCallId: string;
+	toolName: string;
+	input: Record<string, unknown>;
+	isError: boolean;
+}
+
+/**
+ * Structured pre-conversion Provider Context Controller (PI-015).
+ *
+ * When present, the harness decides systemPrompt/messages BEFORE provider
+ * conversion from this controller's output and does NOT force
+ * `session.buildContext()` on the Iris path. When absent, the default native
+ * Session-derived path is used unchanged (byte-compatible).
+ */
+export type AgentHarnessContextController<
+	TContext extends object | undefined,
+	TSkill extends Skill,
+	TPromptTemplate extends PromptTemplate,
+	TTool extends AgentHarnessTool<TContext>,
+> = (params: {
+	session: Session;
+	model: Model<any>;
+	thinkingLevel: ThinkingLevel;
+	activeTools: TTool[];
+	resources: AgentHarnessResources<TSkill, TPromptTemplate>;
+}) => Promise<{
+	systemPrompt: string;
+	messages: AgentMessage[];
+	activeToolNames?: string[];
+}>;
+
 export type AgentHarnessOwnEvent<
 	TSkill extends Skill = Skill,
 	TPromptTemplate extends PromptTemplate = PromptTemplate,
@@ -757,6 +830,9 @@ export type AgentHarnessOwnEvent<
 	| AfterProviderResponseEvent
 	| ToolCallEvent
 	| ToolResultEvent
+	| MessageFinalizedEvent
+	| TurnCommittedEvent
+	| ToolExecutionCommittedEvent
 	| SessionBeforeCompactEvent
 	| SessionCompactEvent
 	| SessionBeforeTreeEvent
@@ -844,6 +920,9 @@ export type AgentHarnessEventResultMap = {
 	save_point: undefined;
 	abort: undefined;
 	settled: undefined;
+	message_finalized: undefined;
+	turn_committed: undefined;
+	tool_execution_committed: undefined;
 };
 
 export interface AgentHarnessPromptOptions {
@@ -958,6 +1037,13 @@ interface AgentHarnessOptionsBase<
 	 */
 	resources?: AgentHarnessResources<TSkill, TPromptTemplate>;
 	systemPrompt?: AgentHarnessSystemPrompt<TContext, TSkill, TPromptTemplate, TTool>;
+	/**
+	 * Optional pre-conversion Provider Context Controller (PI-015). When set,
+	 * the harness uses its systemPrompt/messages output for provider conversion
+	 * and does NOT force `session.buildContext()`; when unset the default native
+	 * Session-derived path runs unchanged.
+	 */
+	contextController?: AgentHarnessContextController<TContext, TSkill, TPromptTemplate, TTool>;
 	/** Curated stream/provider request options. Snapshotted at turn start. */
 	streamOptions?: AgentHarnessStreamOptions;
 	/** Optional retry policy for generated compaction and branch-summary requests. */
