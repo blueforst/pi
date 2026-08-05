@@ -549,7 +549,11 @@ describe("AgentHarness", () => {
 		harness.followUp("follow");
 		harness.nextTurn("next");
 		const abortResultPromise = harness.abort();
-		await new Promise((resolve) => setTimeout(resolve, 0));
+		// The provider may not have been entered yet under parallel load; wait
+		// (bounded) for the signal to be delivered instead of a fixed tick.
+		for (let i = 0; i < 100 && abortedSignal === undefined; i++) {
+			await new Promise((resolve) => setTimeout(resolve, 1));
+		}
 		expect(abortedSignal?.aborted).toBe(true);
 		releaseFirstResponse?.();
 		const abortResult = await abortResultPromise;
