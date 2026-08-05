@@ -44,7 +44,7 @@
 			},
 			"removalCondition": "earendil-works/pi provides awaited append receipts (or an equivalent durability contract) and iris_agent consumes the released contract.",
 			"compatibilityRisk": "low: new additive event; no existing event or API shape is modified.",
-			"notes": "entrySeq is optional because the in-memory Session abstraction does not expose the storage-layer sequence; storage backends may fill it in later."
+			"notes": "entrySeq is optional because the in-memory Session abstraction does not expose the storage-layer sequence; storage backends may fill it in later. 0.83.1: message_finalized now also carries the committed message (commit evidence completeness)."
 		},
 		{
 			"id": "PI-017-runtime-event-lifecycle",
