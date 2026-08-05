@@ -29,13 +29,17 @@
 			"title": "Awaited Session commit receipts for appended entries",
 			"status": "carried",
 			"firstForkCommit": "310e73313cd836cde4014085577a3e46a757192c",
-			"latestForkCommit": "e65e26bd2893895941ecf130e6c5a731b43e2b4b",
-			"genericRuntimeRationale": "Consumers of the Session archive need awaited, durable commit evidence (sessionId, entryId, content hash, optional entrySeq) to attribute messages exactly once and to reconcile crash windows; observer-only events cannot prove durability. Receipts are carried on the new message_finalized lifecycle event; the Session append API itself keeps its existing return contract.",
+			"latestForkCommit": "e209e56163fac2992e8aaf0fbcd67cb4fb663c84",
+			"genericRuntimeRationale": "Consumers of the Session archive need awaited, durable commit evidence (sessionId, entryId, content hash, optional entrySeq) to attribute messages exactly once and to reconcile crash windows; observer-only events cannot prove durability. Receipts are carried on the new message_finalized lifecycle event; the Session append API itself keeps its existing return contract. iris_agent#40 consolidates every supported append path (agent loop, direct appendMessage, pending-writes flush) onto one shared appendAndCommitMessage primitive so no valid durable append can bypass commit evidence.",
 			"affectedPackages": ["@earendil-works/pi-agent-core"],
-			"affectedSurfaces": ["SessionCommitReceipt type", "message_finalized OwnEvent", "content hash computation"],
+			"affectedSurfaces": ["SessionCommitReceipt type", "message_finalized OwnEvent", "content hash computation", "appendAndCommitMessage shared commit primitive"],
 			"tests": [
 				"packages/agent/test/harness/runtime-seams.test.ts (message_finalized carries a full receipt for every appended message)",
-				"packages/agent/test/harness/runtime-seams.test.ts (deterministic content hash via exported computeMessageContentHash)"
+				"packages/agent/test/harness/runtime-seams.test.ts (deterministic content hash via exported computeMessageContentHash)",
+				"packages/agent/test/harness/runtime-seams.test.ts (iris_agent#40: direct appendMessage emits exactly one receipt)",
+				"packages/agent/test/harness/runtime-seams.test.ts (iris_agent#40: pending-writes flush emits one receipt per message in commit order)",
+				"packages/agent/test/harness/runtime-seams.test.ts (iris_agent#40: agent-loop does not double-emit)",
+				"packages/agent/test/harness/runtime-seams.test.ts (iris_agent#40: failed durable append produces no phantom receipt)"
 			],
 			"upstream": {
 				"status": "not_filed",

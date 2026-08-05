@@ -7,11 +7,11 @@
 	},
 	"acceptedRuntime": {
 		"repository": "blueforst/pi",
-		"commit": "47f85a370a30a34a1e1c4533902f33818651d1b0",
-		"tree": "29514de37e13dde5e8452960d6e35a0075369726",
+		"commit": "e209e56163fac2992e8aaf0fbcd67cb4fb663c84",
+		"tree": "771b1634ac4a257b1fce2318966cf4400f5af4c2",
 		"verifiedAt": "2026-08-05",
-		"equivalentCommit": "91bfa59ac45a7f02dbcb64d872c47ab93793d26e",
-		"notes": "47f85a37 is the accepted fork head containing the iris_agent#41 production-lock fix chain (lock surface, validator --verify-git, CI unshallow gate). Its tree is the immutable identity consumers must verify (git rev-parse 47f85a37^{tree}). Prior accepted identities 91bfa59a and fa7aba0a/e18f7dd are ancestors with earlier trees; the accepted identity always covers the fixed lock surface itself. acceptedRuntime is the single authoritative identity for the Pi runtime iris_agent is allowed to consume; floating main is never an accepted identity."
+		"equivalentCommit": "47f85a370a30a34a1e1c4533902f33818651d1b0",
+		"notes": "e209e561 is the accepted fork head containing the iris_agent#40 appendAndCommitMessage commit-receipt consolidation plus the iris_agent#41 production-lock fix chain. Its tree is the immutable identity consumers must verify. Prior accepted identity 47f85a37 is an ancestor. acceptedRuntime is the single authoritative identity for the Pi runtime iris_agent is allowed to consume; floating main is never an accepted identity."
 	},
 	"upstream": {
 		"repository": "earendil-works/pi",
