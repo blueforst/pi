@@ -35,7 +35,7 @@
 			"title": "Awaited Session commit receipts for appended entries",
 			"status": "carried",
 			"firstForkCommit": "310e73313cd836cde4014085577a3e46a757192c",
-			"latestForkCommit": "18d059bfdfcc64f75f9974ac8b15a512b2cd8d5c",
+			"latestForkCommit": "d22db09dcdfac494858c8ff43e478645a3a6fc41",
 			"genericRuntimeRationale": "Consumers of the Session archive need awaited, durable commit evidence (sessionId, entryId, content hash, optional entrySeq) to attribute messages exactly once and to reconcile crash windows; observer-only events cannot prove durability. Receipts are carried on the new message_finalized lifecycle event; the Session append API itself keeps its existing return contract. iris_agent#40 consolidates every supported append path (agent loop, direct appendMessage, pending-writes flush) onto one shared appendAndCommitMessage primitive so no valid durable append can bypass commit evidence.",
 			"affectedPackages": [
 				"@earendil-works/pi-agent-core"
@@ -55,7 +55,8 @@
 				"packages/agent/test/harness/runtime-seams.test.ts (iris_agent#40: failed durable append produces no phantom receipt)",
 				"packages/agent/test/harness/runtime-seams.test.ts (iris_agent#40 Feature 2: crash window leaves pending receipt; recovery replays exactly once with stable identity and commit order)",
 				"packages/agent/test/harness/session-backends.test.ts (JSONL journal survives simulated crash + reopen; marker lines never become entries)",
-				"packages/agent/test/harness/sqlite-node.test.ts (SQLite journal persists across restart; acked rows never re-emit)"
+				"packages/agent/test/harness/sqlite-node.test.ts (SQLite journal persists across restart; acked rows never re-emit)",
+				"packages/agent/test/harness/jsonl-journal-crash.test.ts (iris_agent#51: capability declaration, fsync-less fail-closed journal seam, fallback, fault injection at every truncation point, checksum bit-rot, concurrent seq monotonicity, legacy framing compat)"
 			],
 			"upstream": {
 				"status": "not_filed",
@@ -64,7 +65,7 @@
 			},
 			"removalCondition": "earendil-works/pi provides awaited append receipts (or an equivalent durability contract) and iris_agent consumes the released contract.",
 			"compatibilityRisk": "low: new additive event; no existing event or API shape is modified.",
-			"notes": "entrySeq is optional because the in-memory Session abstraction does not expose the storage-layer sequence; storage backends may fill it in later. 0.83.1: message_finalized now also carries the committed message (commit evidence completeness). Feature 2 (iris_agent#40): the receipt is now crash-consistent via the durable commit journal (appendEntryWithReceipt atomic append+receipt, recoverPendingCommitReceipts replay, ackCommitReceipt) with no Iris semantics; latestForkCommit 18d059bf is the accepted runtime head."
+			"notes": "entrySeq is optional because the in-memory Session abstraction does not expose the storage-layer sequence; storage backends may fill it in later. 0.83.1: message_finalized now also carries the committed message (commit evidence completeness). Feature 2 (iris_agent#40): the receipt is now crash-consistent via the durable commit journal (appendEntryWithReceipt atomic append+receipt, recoverPendingCommitReceipts replay, ackCommitReceipt) with no Iris semantics; latestForkCommit 18d059bf is the accepted runtime head. iris_agent#51: the JSONL journal was upgraded from a bare two-line appendFile (not a transactional boundary) to a self-describing framed journal (v1 frame = entry + receipt + monotonic seq + sha256 checksum in ONE line, fsync via the new optional FileSystem.syncFile capability before the append reports success). Torn tails quarantine with a typed diagnostic; mid-file corruption fails closed; marker-looking message text stays lossless. The backend publishes an explicit supportsCrashRecoverableReceipts capability (true only with fsync); Session falls back to publish-only receipts when the capability is absent. See PI-019."
 		},
 		{
 			"id": "PI-017-runtime-event-lifecycle",
@@ -162,6 +163,35 @@
 			"removalCondition": "earendil-works/pi provides an equivalent crash-consistent commit/outbox mechanism and iris_agent consumes the released contract.",
 			"compatibilityRisk": "low: journal methods are optional; backends without a journal degrade to the plain append path unchanged.",
 			"notes": "First review round found and fixed a marker-line substring false positive (18d059bf structural detection). Replay never re-appends and never re-runs afterAppend, so it cannot duplicate semantic commits."
+		},
+		{
+			"id": "PI-019-jsonl-framed-journal",
+			"title": "Framed, crash-safe JSONL entry+receipt journal with explicit durability capability",
+			"status": "proposed",
+			"genericRuntimeRationale": "A generic runtime that persists Session entries to JSONL needs a crash-recoverable commit journal with a real durability boundary: one appendFile call is not a transactional boundary, so the entry and receipt must be one verifiable frame (version + monotonic seq + sha256 checksum) written and fsynced before the append reports success. The backend publishes an explicit capability (supportsCrashRecoverableReceipts) that is true only when the filesystem provides fsync; callers requiring crash recovery (iris_agent production) fail closed otherwise. Torn tails (the only corruption an interrupted single-process append can produce) quarantine with a typed diagnostic and never fabricate an ACK; mid-file corruption fails closed; legacy pre-framing marker files remain readable.",
+			"affectedPackages": [
+				"@earendil-works/pi-agent-core"
+			],
+			"affectedSurfaces": [
+				"FileSystem.syncFile (optional fsync capability)",
+				"JsonlSessionBackend framed journal (appendEntryWithReceipt/readPendingCommitReceipts/ackCommitReceipt)",
+				"SessionStorage.supportsCrashRecoverableReceipts / SessionStorage.journalDiagnostics",
+				"Session.supportsCrashRecoverableReceipts"
+			],
+			"tests": [
+				"packages/agent/test/harness/jsonl-journal-crash.test.ts (capability declaration, fsync-less fail-closed journal seam, publish-only fallback, fault injection at every truncation point, checksum bit-rot, marker-lossless, concurrent seq monotonicity, idempotent ack, legacy framing compat)",
+				"packages/agent/test/harness/session-backends.test.ts (torn tail quarantines instead of failing the session; mid-file corruption still fails closed)",
+				"packages/agent/test/harness/runtime-seams.test.ts (existing journal crash-window suite still green)",
+				"packages/agent/test/harness/sqlite-node.test.ts (existing SQLite journal suite still green)"
+			],
+			"upstream": {
+				"status": "not_filed",
+				"issue": null,
+				"pullRequest": null
+			},
+			"removalCondition": "earendil-works/pi provides an equivalent framed/transactional JSONL journal with a documented fsync boundary and iris_agent consumes the released package.",
+			"compatibilityRisk": "low: additive; the new frame format only affects newly written journal lines, legacy files remain readable, and capability-less filesystems degrade to the pre-journal publish-only path.",
+			"notes": "Part of iris_agent#51 (torn-write/crash-safety of the JSONL entry+receipt journal). Commit SHAs are filled when the feature branch lands; status moves to carried after the accepted-runtime advancement. Includes the missing-newline torn-tail append guard (review finding, iris_agent#51): appends emit a missing newline first so a complete frame written before a torn tail is never concatenated into a quarantined line."
 		}
 	]
 }
