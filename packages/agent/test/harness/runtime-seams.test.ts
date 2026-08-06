@@ -305,9 +305,9 @@ describe("iris_agent#40: every supported append path yields exactly one commit r
 
 	it("failed durable append produces no receipt/event (no phantom receipts)", async () => {
 		const session = await createInMemorySession();
-		session.appendMessage = (async () => {
+		session.appendMessageWithCommitReceipt = (async () => {
 			throw new Error("storage failure");
-		}) as typeof session.appendMessage;
+		}) as typeof session.appendMessageWithCommitReceipt;
 
 		const finalized: MessageFinalizedEvent[] = [];
 		const harness = new AgentHarness({
@@ -322,5 +322,164 @@ describe("iris_agent#40: every supported append path yields exactly one commit r
 
 		await expect(harness.appendMessage(createUserMessage("will fail"))).rejects.toThrow("storage failure");
 		expect(finalized.length).toBe(0);
+	});
+});
+
+describe("iris_agent#40 Feature 2: crash-consistent commit receipts", () => {
+	it("crash between durable append and publication leaves a pending receipt that recovery replays exactly once", async () => {
+		const session = await createInMemorySession();
+
+		// Direct append publishes immediately, so simulate the crash window by
+		// appending at the storage level: durable append + pending receipt,
+		// but no message_finalized publication (process died).
+		const metadata = await session.getMetadata();
+		const message = createUserMessage("lost publication");
+		const contentHash = await computeMessageContentHash(message);
+		await session.appendMessageWithCommitReceipt(message, (entryId) => ({
+			sessionId: metadata.id,
+			entryId,
+			contentHash,
+			committedAt: new Date().toISOString(),
+		}));
+
+		const pendingBefore = await session.readPendingCommitReceipts();
+		expect(pendingBefore.length).toBe(1);
+
+		// Recovery replays the missed event and acknowledges it.
+		const finalized: MessageFinalizedEvent[] = [];
+		const recoveredHarness = new AgentHarness({
+			models,
+			session,
+			model: newFaux().getModel(),
+			systemPrompt: "You are helpful.",
+		});
+		recoveredHarness.subscribe((event) => {
+			if (event.type === "message_finalized") finalized.push(event as MessageFinalizedEvent);
+		});
+
+		const replayed = await recoveredHarness.recoverPendingCommitReceipts();
+		expect(replayed).toBe(1);
+		expect(finalized.length).toBe(1);
+		expect(finalized[0]!.receipt.entryId).toBe(pendingBefore[0]!.entryId);
+		expect(finalized[0]!.receipt.contentHash).toBe(contentHash);
+		expect(finalized[0]!.message.role).toBe("user");
+
+		// Acknowledged: a second recovery must not re-emit.
+		const secondReplay = await recoveredHarness.recoverPendingCommitReceipts();
+		expect(secondReplay).toBe(0);
+		expect(finalized.length).toBe(1);
+		expect(await session.readPendingCommitReceipts()).toEqual([]);
+	});
+
+	it("recovery preserves receipt identity and commit order across multiple pending receipts", async () => {
+		const session = await createInMemorySession();
+		const metadata = await session.getMetadata();
+		const messages = [createUserMessage("first"), createUserMessage("second"), createUserMessage("third")];
+		const hashes = await Promise.all(messages.map((message) => computeMessageContentHash(message)));
+		for (let i = 0; i < messages.length; i++) {
+			await session.appendMessageWithCommitReceipt(messages[i]!, (entryId) => ({
+				sessionId: metadata.id,
+				entryId,
+				contentHash: hashes[i]!,
+				committedAt: new Date(Date.now() + i).toISOString(),
+			}));
+		}
+
+		const finalized: MessageFinalizedEvent[] = [];
+		const harness = new AgentHarness({
+			models,
+			session,
+			model: newFaux().getModel(),
+			systemPrompt: "You are helpful.",
+		});
+		harness.subscribe((event) => {
+			if (event.type === "message_finalized") finalized.push(event as MessageFinalizedEvent);
+		});
+
+		expect(await harness.recoverPendingCommitReceipts()).toBe(3);
+		expect(finalized.map((event) => event.receipt.contentHash)).toEqual(hashes);
+		// Distinct stable receipt identities.
+		expect(new Set(finalized.map((event) => event.receipt.entryId)).size).toBe(3);
+	});
+
+	it("normal append path still publishes exactly once and ack removes the pending receipt", async () => {
+		const session = await createInMemorySession();
+		const finalized: MessageFinalizedEvent[] = [];
+		const harness = new AgentHarness({
+			models,
+			session,
+			model: newFaux().getModel(),
+			systemPrompt: "You are helpful.",
+		});
+		harness.subscribe((event) => {
+			if (event.type === "message_finalized") finalized.push(event as MessageFinalizedEvent);
+		});
+
+		await harness.appendMessage(createUserMessage("normal path"));
+
+		expect(finalized.length).toBe(1);
+		// Acknowledged after publication: no pending receipt remains.
+		expect(await session.readPendingCommitReceipts()).toEqual([]);
+		expect(await harness.recoverPendingCommitReceipts()).toBe(0);
+		expect(finalized.length).toBe(1);
+	});
+
+	it("agent-loop and pending-flush paths also ack their receipts (no replay duplicates)", async () => {
+		const session = await createInMemorySession();
+		const registration = newFaux();
+		registration.setResponses([async () => fauxAssistantMessage("turn answer")]);
+		const finalized: MessageFinalizedEvent[] = [];
+		const harness = new AgentHarness({
+			models,
+			session,
+			model: registration.getModel(),
+			systemPrompt: "You are helpful.",
+		});
+		harness.subscribe((event) => {
+			if (event.type === "message_finalized") finalized.push(event as MessageFinalizedEvent);
+		});
+
+		const promptPromise = harness.prompt("hello");
+		await harness.appendMessage(createUserMessage("queued"));
+		await promptPromise;
+
+		// Agent loop (user + assistant) + one queued append.
+		expect(finalized.length).toBe(3);
+		expect(await session.readPendingCommitReceipts()).toEqual([]);
+		expect(await harness.recoverPendingCommitReceipts()).toBe(0);
+		expect(finalized.length).toBe(3);
+	});
+
+	it("recovery replays events in commit order relative to later lifecycle events", async () => {
+		const session = await createInMemorySession();
+		// Simulate a crash with one unacknowledged receipt from a previous run.
+		const metadata = await session.getMetadata();
+		const message = createUserMessage("pre-crash message");
+		const contentHash = await computeMessageContentHash(message);
+		await session.appendMessageWithCommitReceipt(message, (entryId) => ({
+			sessionId: metadata.id,
+			entryId,
+			contentHash,
+			committedAt: new Date().toISOString(),
+		}));
+
+		const order: string[] = [];
+		const harness = new AgentHarness({
+			models,
+			session,
+			model: newFaux().getModel(),
+			systemPrompt: "You are helpful.",
+		});
+		harness.subscribe((event) => {
+			if (event.type === "message_finalized" || event.type === "turn_committed" || event.type === "settled") {
+				order.push(event.type);
+			}
+		});
+
+		// Recovery runs before any new turn: the replayed finalized event must
+		// precede all subsequent lifecycle events.
+		await harness.recoverPendingCommitReceipts();
+		await harness.appendMessage(createUserMessage("post-recovery"));
+		expect(order).toEqual(["message_finalized", "message_finalized"]);
 	});
 });

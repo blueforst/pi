@@ -1,5 +1,7 @@
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { createModels, type FauxProviderHandle, fauxProvider } from "@earendil-works/pi-ai";
 import { describe, expect, it } from "vitest";
+import { AgentHarness, computeMessageContentHash } from "../../src/harness/agent-harness.ts";
 import { NodeExecutionEnv } from "../../src/harness/env/nodejs.ts";
 import {
 	JsonlSessionBackend,
@@ -8,7 +10,16 @@ import {
 } from "../../src/harness/session/jsonl-repo.ts";
 import { InMemorySessionRepository } from "../../src/harness/session/memory-repo.ts";
 import type { Session } from "../../src/harness/session/session.ts";
+import type { MessageFinalizedEvent } from "../../src/harness/types.ts";
 import { createAssistantMessage, createTempDir, createUserMessage } from "./session-test-utils.ts";
+
+const models = createModels();
+let fauxCount = 0;
+function newFaux(): FauxProviderHandle {
+	const faux = fauxProvider({ provider: `seam-faux-${++fauxCount}` });
+	models.setProvider(faux.provider);
+	return faux;
+}
 
 async function appendUsageEntries(session: Session) {
 	const assistant = createAssistantMessage("reply");
@@ -195,5 +206,95 @@ describe("JsonlSessionBackend", () => {
 		};
 		writeFileSync(metadata.path, `${JSON.stringify(header)}\n`);
 		await expect(repo.open(metadata)).rejects.toThrow("session header metadata must be an object");
+	});
+});
+
+describe("JSONL crash-consistent commit journal (iris_agent#40 Feature 2)", () => {
+	it("survives a simulated crash: pending receipt persists and replays after reopening", async () => {
+		const root = createTempDir();
+		const env = new NodeExecutionEnv({ cwd: root });
+		const repo = new JsonlSessionRepository({ fs: env, sessionsRoot: root });
+		const session = await repo.create({ cwd: root, id: "session-crash-1" });
+		const metadata = await session.getMetadata();
+
+		// Simulate a crash between the durable append and publication: record
+		// the entry + pending receipt at the storage level, then "die" by
+		// disposing without ever publishing message_finalized.
+		const message = createUserMessage("crash window");
+		const contentHash = await computeMessageContentHash(message);
+		await session.appendMessageWithCommitReceipt(message, (entryId) => ({
+			sessionId: metadata.id,
+			entryId,
+			contentHash,
+			committedAt: new Date().toISOString(),
+		}));
+		await repo[Symbol.asyncDispose]();
+
+		// Reopen the same session file with a fresh repository (process restart).
+		const reopenedRepo = new JsonlSessionRepository({ fs: env, sessionsRoot: root });
+		const reopened = await reopenedRepo.open(metadata);
+		// The journal survived the restart; the entry is readable and the
+		// receipt is still pending (no phantom ack was written).
+		expect((await reopened.readPendingCommitReceipts()).length).toBe(1);
+
+		const finalized: MessageFinalizedEvent[] = [];
+		const harness = new AgentHarness({
+			models,
+			session: reopened,
+			model: newFaux().getModel(),
+			systemPrompt: "You are helpful.",
+		});
+		harness.subscribe((event) => {
+			if (event.type === "message_finalized") finalized.push(event as MessageFinalizedEvent);
+		});
+
+		expect(await harness.recoverPendingCommitReceipts()).toBe(1);
+		expect(finalized.length).toBe(1);
+		expect(finalized[0]!.receipt.contentHash).toBe(contentHash);
+		expect(finalized[0]!.receipt.entryId).toBe(await reopened.getLeafId());
+		expect(await reopened.readPendingCommitReceipts()).toEqual([]);
+
+		// Reopening again must not re-emit (ack marker persisted).
+		const reopenedAgainRepo = new JsonlSessionRepository({ fs: env, sessionsRoot: root });
+		const reopenedAgain = await reopenedAgainRepo.open(metadata);
+		const harness2 = new AgentHarness({
+			models,
+			session: reopenedAgain,
+			model: newFaux().getModel(),
+			systemPrompt: "You are helpful.",
+		});
+		const secondRun: MessageFinalizedEvent[] = [];
+		harness2.subscribe((event) => {
+			if (event.type === "message_finalized") secondRun.push(event as MessageFinalizedEvent);
+		});
+		expect(await harness2.recoverPendingCommitReceipts()).toBe(0);
+		expect(secondRun.length).toBe(0);
+		await reopenedAgainRepo[Symbol.asyncDispose]();
+	});
+
+	it("loadJsonlSession skips journal marker lines (they are not entries)", async () => {
+		const root = createTempDir();
+		const env = new NodeExecutionEnv({ cwd: root });
+		const repo = new JsonlSessionRepository({ fs: env, sessionsRoot: root });
+		const session = await repo.create({ cwd: root, id: "session-journal-1" });
+		const metadata = await session.getMetadata();
+		const message = createUserMessage("marker test");
+		const contentHash = await computeMessageContentHash(message);
+		await session.appendMessageWithCommitReceipt(message, (entryId) => ({
+			sessionId: metadata.id,
+			entryId,
+			contentHash,
+			committedAt: new Date().toISOString(),
+		}));
+		await repo[Symbol.asyncDispose]();
+
+		// The file now contains entry + receipt marker (+ no ack yet). Opening
+		// must yield exactly one session entry (the message), not the marker.
+		const reopenedRepo = new JsonlSessionRepository({ fs: env, sessionsRoot: root });
+		const reopened = await reopenedRepo.open(metadata);
+		const entries = await reopened.getEntries();
+		expect(entries.length).toBe(1);
+		expect(entries[0]!.type).toBe("message");
+		await reopenedRepo[Symbol.asyncDispose]();
 	});
 });

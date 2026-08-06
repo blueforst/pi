@@ -13,7 +13,13 @@ import { AgentHarness } from "../../src/harness/agent-harness.ts";
 import { NodeExecutionEnv } from "../../src/harness/env/nodejs.ts";
 import { InMemorySessionBackend } from "../../src/harness/session/memory-repo.ts";
 import { createSession, type Session } from "../../src/harness/session/session.ts";
-import type { AgentHarnessTool, PromptTemplate, Skill } from "../../src/harness/types.ts";
+import type {
+	AgentHarnessTool,
+	PromptTemplate,
+	SessionCommitReceipt,
+	SessionTreeEntry,
+	Skill,
+} from "../../src/harness/types.ts";
 import type { AgentMessage, AgentTool } from "../../src/types.ts";
 import { calculateTool, createCalculateToolWithUsage } from "../utils/calculate.ts";
 import { getCurrentTimeTool } from "../utils/get-current-time.ts";
@@ -107,6 +113,12 @@ async function createBlockingSession(expectedWrites: number): Promise<{
 			if (writesStarted === expectedWrites) allWritesStarted.resolve();
 			await releaseWrites.promise;
 			await storage.appendEntry(entry);
+		},
+		async appendEntryWithReceipt(entry: SessionTreeEntry, receipt: SessionCommitReceipt) {
+			writesStarted++;
+			if (writesStarted === expectedWrites) allWritesStarted.resolve();
+			await releaseWrites.promise;
+			await storage.appendEntryWithReceipt!(entry, receipt);
 		},
 	});
 	const blockingBackend: Pick<
