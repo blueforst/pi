@@ -1,9 +1,17 @@
 {
-	"schemaVersion": 1,
+	"schemaVersion": 2,
 	"fork": {
 		"repository": "blueforst/pi",
 		"defaultBranch": "main",
 		"baselineCommit": "ab5f8d88ee1d400c0c8fb5c50ac10b2f4a4851d1"
+	},
+	"acceptedRuntime": {
+		"repository": "blueforst/pi",
+		"commit": "47f85a370a30a34a1e1c4533902f33818651d1b0",
+		"tree": "29514de37e13dde5e8452960d6e35a0075369726",
+		"verifiedAt": "2026-08-05",
+		"equivalentCommit": "91bfa59ac45a7f02dbcb64d872c47ab93793d26e",
+		"notes": "47f85a37 is the accepted fork head containing the iris_agent#41 production-lock fix chain (lock surface, validator --verify-git, CI unshallow gate). Its tree is the immutable identity consumers must verify (git rev-parse 47f85a37^{tree}). Prior accepted identities 91bfa59a and fa7aba0a/e18f7dd are ancestors with earlier trees; the accepted identity always covers the fixed lock surface itself. acceptedRuntime is the single authoritative identity for the Pi runtime iris_agent is allowed to consume; floating main is never an accepted identity."
 	},
 	"upstream": {
 		"repository": "earendil-works/pi",

@@ -1,5 +1,5 @@
 {
-	"schemaVersion": 1,
+	"schemaVersion": 2,
 	"upstreamBaseCommit": "e741cb05ca7c1c7bc5a9664c99697df32de9fac6",
 	"patches": [
 		{

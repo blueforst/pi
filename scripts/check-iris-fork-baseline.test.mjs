@@ -17,14 +17,22 @@ const REPO_ROOT = dirname(dirname(SCRIPT));
 
 const SHA_FORK = "ab5f8d88ee1d400c0c8fb5c50ac10b2f4a4851d1";
 const SHA_UPSTREAM = "e741cb05ca7c1c7bc5a9664c99697df32de9fac6";
+const SHA_ACCEPTED = "fa7aba0a5240ead1679dced5a5e12a0fe7df2800";
+const SHA_ACCEPTED_TREE = "1b43382f421da75ee20a78d3bf2ef4342e776bf6";
 
 function validLock() {
 	return {
-		schemaVersion: 1,
+		schemaVersion: 2,
 		fork: {
 			repository: "blueforst/pi",
 			defaultBranch: "main",
 			baselineCommit: SHA_FORK,
+		},
+		acceptedRuntime: {
+			repository: "blueforst/pi",
+			commit: SHA_ACCEPTED,
+			tree: SHA_ACCEPTED_TREE,
+			verifiedAt: "2026-08-05",
 		},
 		upstream: {
 			repository: "earendil-works/pi",
@@ -51,7 +59,7 @@ function validLock() {
 
 function validPatches() {
 	return {
-		schemaVersion: 1,
+		schemaVersion: 2,
 		upstreamBaseCommit: SHA_UPSTREAM,
 		patches: [],
 	};
@@ -210,10 +218,58 @@ test("rejects upstream base mismatch", () => {
 
 test("rejects unsupported schema version", () => {
 	const lock = validLock();
-	lock.schemaVersion = 2;
+	lock.schemaVersion = 3;
 	const { status, stderr } = runCli(lock, validPatches());
 	assert.equal(status, 1);
 	assert.match(stderr, /schemaVersion: unsupported value/);
+});
+
+test("rejects schema v1 without acceptedRuntime", () => {
+	const lock = validLock();
+	delete lock.acceptedRuntime;
+	const { status, stderr } = runCli(lock, validPatches());
+	assert.equal(status, 1);
+	assert.match(stderr, /missing required field: acceptedRuntime\.repository/);
+});
+
+test("rejects acceptedRuntime commit equal to fork baseline", () => {
+	const lock = validLock();
+	lock.acceptedRuntime.commit = SHA_FORK;
+	const { status, stderr } = runCli(lock, validPatches());
+	assert.equal(status, 1);
+	assert.match(stderr, /acceptedRuntime\.commit must differ from fork\.baselineCommit/);
+});
+
+test("rejects acceptedRuntime wrong repository", () => {
+	const lock = validLock();
+	lock.acceptedRuntime.repository = "someone-else/pi";
+	const { status, stderr } = runCli(lock, validPatches());
+	assert.equal(status, 1);
+	assert.match(stderr, /acceptedRuntime\.repository: expected blueforst\/pi/);
+});
+
+test("rejects acceptedRuntime malformed tree", () => {
+	const lock = validLock();
+	lock.acceptedRuntime.tree = "short";
+	const { status, stderr } = runCli(lock, validPatches());
+	assert.equal(status, 1);
+	assert.match(stderr, /acceptedRuntime\.tree: expected full 40-character hex commit SHA/);
+});
+
+test("rejects acceptedRuntime zero tree", () => {
+	const lock = validLock();
+	lock.acceptedRuntime.tree = "0".repeat(40);
+	const { status, stderr } = runCli(lock, validPatches());
+	assert.equal(status, 1);
+	assert.match(stderr, /acceptedRuntime\.tree: zero SHA is not a valid baseline/);
+});
+
+test("rejects acceptedRuntime missing verifiedAt", () => {
+	const lock = validLock();
+	delete lock.acceptedRuntime.verifiedAt;
+	const { status, stderr } = runCli(lock, validPatches());
+	assert.equal(status, 1);
+	assert.match(stderr, /missing required field: acceptedRuntime\.verifiedAt/);
 });
 
 test("rejects wrong fork repository", () => {
@@ -412,23 +468,127 @@ test("rejects lastVerifiedAt earlier than upstream verifiedAt", () => {
 test("rejects defaultBranch other than main", () => {
 	const lock = validLock();
 	lock.fork.defaultBranch = "dev";
-	assertFailsWithFieldError(runCli(lock, validPatches()), /fork\.defaultBranch: schema v1 requires "main"/);
+	assertFailsWithFieldError(runCli(lock, validPatches()), /fork\.defaultBranch: schema v2 requires "main"/);
 });
 
 test("rejects packageManager other than npm", () => {
 	const lock = validLock();
 	lock.runtime.packageManager = "pnpm";
-	assertFailsWithFieldError(runCli(lock, validPatches()), /runtime\.packageManager: schema v1 requires "npm"/);
+	assertFailsWithFieldError(runCli(lock, validPatches()), /runtime\.packageManager: schema v2 requires "npm"/);
 });
 
 test("rejects lockfile other than package-lock.json", () => {
 	const lock = validLock();
 	lock.runtime.lockfile = "yarn.lock";
-	assertFailsWithFieldError(runCli(lock, validPatches()), /runtime\.lockfile: schema v1 requires "package-lock\.json"/);
+	assertFailsWithFieldError(runCli(lock, validPatches()), /runtime\.lockfile: schema v2 requires "package-lock\.json"/);
 });
 
 test("validates the real manifests via default paths", () => {
 	const result = spawnSync(process.execPath, [SCRIPT], { cwd: REPO_ROOT, encoding: "utf8" });
 	assert.equal(result.status, 0);
 	assert.match(result.stdout, /OK: iris fork baseline manifests are valid/);
+});
+
+// --- git-backed acceptedRuntime provenance (issue iris_agent#41) ---
+
+function makeGitRepo() {
+	const dir = mkdtempSync(join(tmpdir(), "iris-fork-git-"));
+	fixtureDirs.push(dir);
+	spawnSync("git", ["init", "-q", "-b", "main", dir], { encoding: "utf8" });
+	spawnSync("git", ["-C", dir, "config", "user.email", "test@example.com"], { encoding: "utf8" });
+	spawnSync("git", ["-C", dir, "config", "user.name", "Test"], { encoding: "utf8" });
+	writeFileSync(join(dir, "README.md"), "# test repo\n");
+	spawnSync("git", ["-C", dir, "add", "README.md"], { encoding: "utf8" });
+	const commitResult = spawnSync("git", ["-C", dir, "commit", "-q", "-m", "baseline"], { encoding: "utf8" });
+	assert.equal(commitResult.status, 0);
+	const commit = spawnSync("git", ["-C", dir, "rev-parse", "HEAD"], { encoding: "utf8" }).stdout.trim();
+	const tree = spawnSync("git", ["-C", dir, "rev-parse", "HEAD^{tree}"], { encoding: "utf8" }).stdout.trim();
+	return { dir, commit, tree };
+}
+
+test("--verify-git accepts matching commit and tree in a real repository", () => {
+	const { dir, commit, tree } = makeGitRepo();
+	const lock = validLock();
+	lock.acceptedRuntime.commit = commit;
+	lock.acceptedRuntime.tree = tree;
+	const patches = validPatches();
+	const dir2 = mkdtempSync(join(tmpdir(), "iris-fork-git-"));
+	fixtureDirs.push(dir2);
+	const lockPath = join(dir2, "production-lock.json");
+	const patchesPath = join(dir2, "carried-patches.json");
+	writeFileSync(lockPath, JSON.stringify(lock, null, "	"));
+	writeFileSync(patchesPath, JSON.stringify(patches, null, "	"));
+	const result = spawnSync(process.execPath, [SCRIPT, "--verify-git", lockPath, patchesPath, dir], {
+		cwd: dir,
+		encoding: "utf8",
+	});
+	assert.equal(result.status, 0, result.stderr);
+	assert.match(result.stdout, /git-verified/);
+});
+
+test("--verify-git rejects a commit that does not exist", () => {
+	const { dir, tree } = makeGitRepo();
+	const lock = validLock();
+	lock.acceptedRuntime.commit = "f".repeat(40);
+	lock.acceptedRuntime.tree = tree;
+	const dir2 = mkdtempSync(join(tmpdir(), "iris-fork-git-"));
+	fixtureDirs.push(dir2);
+	const lockPath = join(dir2, "production-lock.json");
+	writeFileSync(lockPath, JSON.stringify(lock, null, "	"));
+	writeFileSync(join(dir2, "carried-patches.json"), JSON.stringify(validPatches(), null, "	"));
+	const result = spawnSync(process.execPath, [SCRIPT, "--verify-git", lockPath, join(dir2, "carried-patches.json"), dir], {
+		cwd: dir,
+		encoding: "utf8",
+	});
+	assert.equal(result.status, 1);
+	assert.match(result.stderr, /does not exist in git repository/);
+});
+
+test("--verify-git rejects a tree mismatch for the pinned commit", () => {
+	const { dir, commit } = makeGitRepo();
+	const lock = validLock();
+	lock.acceptedRuntime.commit = commit;
+	lock.acceptedRuntime.tree = "a".repeat(40);
+	const dir2 = mkdtempSync(join(tmpdir(), "iris-fork-git-"));
+	fixtureDirs.push(dir2);
+	const lockPath = join(dir2, "production-lock.json");
+	writeFileSync(lockPath, JSON.stringify(lock, null, "	"));
+	writeFileSync(join(dir2, "carried-patches.json"), JSON.stringify(validPatches(), null, "	"));
+	const result = spawnSync(process.execPath, [SCRIPT, "--verify-git", lockPath, join(dir2, "carried-patches.json"), dir], {
+		cwd: dir,
+		encoding: "utf8",
+	});
+	assert.equal(result.status, 1);
+	assert.match(result.stderr, /acceptedRuntime\.tree mismatch/);
+});
+
+test("--verify-git rejects a carried patch that is not an ancestor", () => {
+	const { dir, commit, tree } = makeGitRepo();
+	// Create a second, unrelated branch commit that is NOT an ancestor of HEAD.
+	spawnSync("git", ["-C", dir, "checkout", "-q", "-b", "other"], { encoding: "utf8" });
+	writeFileSync(join(dir, "other.txt"), "other\n");
+	spawnSync("git", ["-C", dir, "add", "other.txt"], { encoding: "utf8" });
+	spawnSync("git", ["-C", dir, "commit", "-q", "-m", "other"], { encoding: "utf8" });
+	const otherCommit = spawnSync("git", ["-C", dir, "rev-parse", "HEAD"], { encoding: "utf8" }).stdout.trim();
+	spawnSync("git", ["-C", dir, "checkout", "-q", "main"], { encoding: "utf8" });
+
+	const lock = validLock();
+	lock.acceptedRuntime.commit = commit;
+	lock.acceptedRuntime.tree = tree;
+	const patches = validPatches();
+	const patch = samplePatch();
+	patch.latestForkCommit = otherCommit;
+	patches.patches.push(patch);
+
+	const dir2 = mkdtempSync(join(tmpdir(), "iris-fork-git-"));
+	fixtureDirs.push(dir2);
+	const lockPath = join(dir2, "production-lock.json");
+	writeFileSync(lockPath, JSON.stringify(lock, null, "	"));
+	writeFileSync(join(dir2, "carried-patches.json"), JSON.stringify(patches, null, "	"));
+	const result = spawnSync(process.execPath, [SCRIPT, "--verify-git", lockPath, join(dir2, "carried-patches.json"), dir], {
+		cwd: dir,
+		encoding: "utf8",
+	});
+	assert.equal(result.status, 1);
+	assert.match(result.stderr, /is not an ancestor of acceptedRuntime\.commit/);
 });

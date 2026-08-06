@@ -11,12 +11,13 @@
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { spawnSync } from "node:child_process";
 
 const SCRIPTS_DIR = dirname(fileURLToPath(import.meta.url));
 const DEFAULT_LOCK_PATH = join(SCRIPTS_DIR, "..", "docs", "iris-fork", "production-lock.json");
 const DEFAULT_PATCHES_PATH = join(SCRIPTS_DIR, "..", "docs", "iris-fork", "carried-patches.json");
 
-export const SUPPORTED_SCHEMA_VERSION = 1;
+export const SUPPORTED_SCHEMA_VERSION = 2;
 
 export const FORK_REPOSITORY = "blueforst/pi";
 export const UPSTREAM_REPOSITORY = "earendil-works/pi";
@@ -37,6 +38,10 @@ const PRODUCTION_LOCK_REQUIRED_FIELDS = [
 	"fork.repository",
 	"fork.defaultBranch",
 	"fork.baselineCommit",
+	"acceptedRuntime.repository",
+	"acceptedRuntime.commit",
+	"acceptedRuntime.tree",
+	"acceptedRuntime.verifiedAt",
 	"upstream.repository",
 	"upstream.baseCommit",
 	"upstream.verifiedAt",
@@ -195,15 +200,15 @@ function checkLockInvariants(lock, label) {
 	const errors = [];
 	const defaultBranch = getPath(lock, "fork.defaultBranch");
 	if (defaultBranch !== undefined && defaultBranch !== "main") {
-		errors.push(`${label}: fork.defaultBranch: schema v1 requires "main", got ${JSON.stringify(defaultBranch)}`);
+		errors.push(`${label}: fork.defaultBranch: schema v${SUPPORTED_SCHEMA_VERSION} requires "main", got ${JSON.stringify(defaultBranch)}`);
 	}
 	const packageManager = getPath(lock, "runtime.packageManager");
 	if (packageManager !== undefined && packageManager !== "npm") {
-		errors.push(`${label}: runtime.packageManager: schema v1 requires "npm", got ${JSON.stringify(packageManager)}`);
+		errors.push(`${label}: runtime.packageManager: schema v${SUPPORTED_SCHEMA_VERSION} requires "npm", got ${JSON.stringify(packageManager)}`);
 	}
 	const lockfile = getPath(lock, "runtime.lockfile");
 	if (lockfile !== undefined && lockfile !== "package-lock.json") {
-		errors.push(`${label}: runtime.lockfile: schema v1 requires "package-lock.json", got ${JSON.stringify(lockfile)}`);
+		errors.push(`${label}: runtime.lockfile: schema v${SUPPORTED_SCHEMA_VERSION} requires "package-lock.json", got ${JSON.stringify(lockfile)}`);
 	}
 	const upstreamBase = getPath(lock, "upstream.baseCommit");
 	const lastVerifiedUpstream = getPath(lock, "sync.lastVerifiedUpstreamCommit");
@@ -240,6 +245,21 @@ export function validateProductionLock(lock, label = "production-lock.json") {
 	errors.push(...checkShaField(lock, "sync.lastVerifiedUpstreamCommit", label));
 	errors.push(...checkIsoDateField(lock, "upstream.verifiedAt", label));
 	errors.push(...checkIsoDateField(lock, "sync.lastVerifiedAt", label));
+	// acceptedRuntime: the immutable identity consumers are allowed to run.
+	// It must be a real commit AND a real tree of that commit; it must not be
+	// the initial fork baseline (issue iris_agent#41: the lock must express an
+	// accepted runtime identity beyond the bootstrap baseline).
+	if (getPath(lock, "acceptedRuntime.repository") !== FORK_REPOSITORY) {
+		errors.push(`${label}: acceptedRuntime.repository: expected ${FORK_REPOSITORY}, got ${JSON.stringify(getPath(lock, "acceptedRuntime.repository"))}`);
+	}
+	errors.push(...checkShaField(lock, "acceptedRuntime.commit", label));
+	errors.push(...checkShaField(lock, "acceptedRuntime.tree", label));
+	errors.push(...checkIsoDateField(lock, "acceptedRuntime.verifiedAt", label));
+	const baselineCommit = getPath(lock, "fork.baselineCommit");
+	const acceptedCommit = getPath(lock, "acceptedRuntime.commit");
+	if (acceptedCommit !== undefined && baselineCommit !== undefined && acceptedCommit === baselineCommit) {
+		errors.push(`${label}: acceptedRuntime.commit must differ from fork.baselineCommit (the accepted runtime identity cannot be only the initial bootstrap baseline)`);
+	}
 	["runtime.node", "runtime.packageManager", "runtime.lockfile"].forEach((path) => checkNonEmptyStringField(lock, path, label).forEach((e) => errors.push(e)));
 	errors.push(...checkEnumField(lock, "distribution.packageIdentityStatus", PACKAGE_IDENTITY_STATUSES, label));
 	errors.push(...checkEnumField(lock, "distribution.publishStatus", PUBLISH_STATUSES, label));
@@ -332,6 +352,68 @@ export function validateBaselineConsistency(lock, patchesDoc, lockLabel = "produ
 	return errors;
 }
 
+// Git-backed provenance validation (issue iris_agent#41).
+// Requires a git repository at repoDir; verifies the acceptedRuntime identity
+// really exists in that repository and that its tree matches the lock.
+// Optionally verifies carried patches are ancestors of the accepted commit.
+export function validateAcceptedRuntimeInGit(lock, repoDir, { verifyPatches = false, patchesDoc = null } = {}) {
+	const errors = [];
+	const acceptedCommit = getPath(lock, "acceptedRuntime.commit");
+	const acceptedTree = getPath(lock, "acceptedRuntime.tree");
+	if (!isSha(acceptedCommit) || !isSha(acceptedTree)) {
+		// Shape errors are reported by validateProductionLock; nothing to do here.
+		return errors;
+	}
+	try {
+		// rev-parse --verify accepts any 40-hex string even when the object
+		// does not exist; cat-file -e is the existence check.
+		const head = spawnSync("git", ["-C", repoDir, "cat-file", "-e", `${acceptedCommit}^{commit}`], {
+			encoding: "utf8",
+		});
+		if (head.status !== 0) {
+			errors.push(`acceptedRuntime.commit ${acceptedCommit} does not exist in git repository ${repoDir}`);
+			return errors;
+		}
+	} catch (error) {
+		errors.push(`acceptedRuntime git check failed for ${repoDir}: ${error.message}`);
+		return errors;
+	}
+	const treeCheck = spawnSync("git", ["-C", repoDir, "rev-parse", `${acceptedCommit}^{tree}`], {
+		encoding: "utf8",
+	});
+	if (treeCheck.status !== 0) {
+		errors.push(`cannot resolve tree of acceptedRuntime.commit ${acceptedCommit}: ${treeCheck.stderr?.trim()}`);
+		return errors;
+	}
+	const actualTree = treeCheck.stdout.trim();
+	if (actualTree !== acceptedTree) {
+		errors.push(
+			`acceptedRuntime.tree mismatch: lock records ${acceptedTree}, git resolves ${actualTree} for commit ${acceptedCommit}`
+		);
+	}
+	if (verifyPatches && isObject(patchesDoc) && Array.isArray(patchesDoc.patches)) {
+		for (let index = 0; index < patchesDoc.patches.length; index++) {
+			const patch = patchesDoc.patches[index];
+			if (!isObject(patch)) continue;
+			// Only patches whose identity is fixed in the fork must be
+			// contained in the accepted runtime commit.
+			const status = patch.status;
+			if (!["carried", "upstreamed", "removable", "removed"].includes(status)) continue;
+			const latest = patch.latestForkCommit;
+			if (!isSha(latest)) continue;
+			const ancestorCheck = spawnSync("git", ["-C", repoDir, "merge-base", "--is-ancestor", latest, acceptedCommit], {
+				encoding: "utf8",
+			});
+			if (ancestorCheck.status !== 0) {
+				errors.push(
+					`carried-patches.json: patches[${index}] ${JSON.stringify(patch.id)}: latestForkCommit ${latest} is not an ancestor of acceptedRuntime.commit ${acceptedCommit}`
+				);
+			}
+		}
+	}
+	return errors;
+}
+
 export function checkIrisForkBaseline(lockPath, patchesPath) {
 	const lockLabel = lockPath;
 	const patchesLabel = patchesPath;
@@ -356,16 +438,43 @@ export function checkIrisForkBaseline(lockPath, patchesPath) {
 }
 
 function main() {
-	const [lockArg, patchesArg] = process.argv.slice(2);
+	const args = process.argv.slice(2);
+	const verifyGit = args.includes("--verify-git");
+	const positional = args.filter((arg) => arg !== "--verify-git");
+	// Optional third positional: git repository to verify against.
+	// Defaults to the repository hosting this script (the Pi fork checkout).
+	const [lockArg, patchesArg, gitRepoArg] = positional;
 	const lockPath = lockArg ?? DEFAULT_LOCK_PATH;
 	const patchesPath = patchesArg ?? DEFAULT_PATCHES_PATH;
 	const result = checkIrisForkBaseline(lockPath, patchesPath);
-	if (result.ok) {
-		console.log("OK: iris fork baseline manifests are valid");
+	const errors = [...result.errors];
+	if (verifyGit) {
+		// Verify the accepted runtime identity against the repository that
+		// hosts this manifest (the Pi fork checkout itself). Repo root is the
+		// script's repo root, independent of the manifest paths passed in.
+		let lock;
+		try {
+			lock = JSON.parse(readFileSync(lockPath, "utf8"));
+		} catch {
+			lock = null;
+		}
+		let patchesDoc = null;
+		try {
+			patchesDoc = JSON.parse(readFileSync(patchesPath, "utf8"));
+		} catch {
+			patchesDoc = null;
+		}
+		if (lock !== null) {
+			const repoDir = gitRepoArg ?? dirname(SCRIPTS_DIR); // <repo-root>/scripts -> <repo-root>
+			errors.push(...validateAcceptedRuntimeInGit(lock, repoDir, { verifyPatches: true, patchesDoc }));
+		}
+	}
+	if (errors.length === 0) {
+		console.log("OK: iris fork baseline manifests are valid" + (verifyGit ? " (git-verified)" : ""));
 		return;
 	}
 	console.error("FAIL: iris fork baseline manifests are invalid:");
-	for (const error of result.errors) {
+	for (const error of errors) {
 		console.error(`- ${error}`);
 	}
 	process.exit(1);

@@ -35,9 +35,7 @@ function textContent(message: AgentMessage): string {
 	const content = message.content;
 	if (typeof content === "string") return content;
 	return content
-		.filter(
-			(part): part is Extract<typeof part, { type: "text"; text: string }> => part.type === "text",
-		)
+		.filter((part): part is Extract<typeof part, { type: "text"; text: string }> => part.type === "text")
 		.map((part) => part.text)
 		.join("");
 }
