@@ -621,7 +621,7 @@ export class AgentHarness<
 		while (this.pendingSessionWrites.length > 0) {
 			const write = this.pendingSessionWrites[0]!;
 			if (write.type === "message") {
-				await this.session.appendMessage(write.message);
+				await this.appendAndCommitMessage(write.message);
 			} else if (write.type === "model_change") {
 				await this.session.appendModelChange(write.provider, write.modelId);
 			} else if (write.type === "thinking_level_change") {
@@ -643,30 +643,52 @@ export class AgentHarness<
 		}
 	}
 
+	/**
+	 * Shared generic commit primitive (iris_agent#40): every supported durable
+	 * message append path funnels through here so each committed message yields
+	 * exactly one SessionCommitReceipt and exactly one canonical lifecycle
+	 * event (message_finalized). Durable append happens first; if it fails the
+	 * method throws and no receipt/event is produced (no phantom receipts).
+	 * afterAppend runs between the durable append and the receipt publication
+	 * so callers can preserve their existing observer-event ordering.
+	 */
+	private async appendAndCommitMessage(
+		message: AgentMessage,
+		signal?: AbortSignal,
+		afterAppend?: () => Promise<void>,
+	): Promise<void> {
+		const entryId = await this.session.appendMessage(message);
+		await afterAppend?.();
+		const sessionMetadata = await this.session.getMetadata();
+		const contentHash = await computeMessageContentHash(message);
+		await this.emitOwn(
+			{
+				type: "message_finalized",
+				entryId,
+				role: message.role,
+				contentHash,
+				message,
+				receipt: {
+					sessionId: sessionMetadata.id,
+					entryId,
+					contentHash,
+					committedAt: new Date().toISOString(),
+				},
+			},
+			signal,
+		);
+	}
+
 	private async handleAgentEvent(event: AgentEvent, signal?: AbortSignal): Promise<void> {
 		if (event.type === "message_end") {
-			const entryId = await this.session.appendMessage(event.message);
-			await this.emitAny(event, signal);
-			// PI-016/PI-017: emit the durable commit receipt + lifecycle event
-			// for the appended entry (exactly once per append).
-			const sessionMetadata = await this.session.getMetadata();
-			const contentHash = await computeMessageContentHash(event.message);
-			await this.emitOwn(
-				{
-					type: "message_finalized",
-					entryId,
-					role: event.message.role,
-					contentHash,
-					message: event.message,
-					receipt: {
-						sessionId: sessionMetadata.id,
-						entryId,
-						contentHash,
-						committedAt: new Date().toISOString(),
-					},
-				},
-				signal,
-			);
+			// PI-016/PI-017: the agent-loop append path shares the same generic
+			// commit primitive as direct appends and pending-writes flush, so
+			// receipts/events are emitted exactly once per durable append.
+			// Order kept as before: durable append, then the message_end
+			// observer event, then the message_finalized commit event.
+			await this.appendAndCommitMessage(event.message, signal, async () => {
+				await this.emitAny(event, signal);
+			});
 			return;
 		}
 		if (event.type === "turn_end") {
@@ -861,7 +883,9 @@ export class AgentHarness<
 		return this.track("mutation", async () => {
 			try {
 				if (this.phase === "idle") {
-					await this.session.appendMessage(message);
+					// iris_agent#40: direct appends use the shared commit
+					// primitive so they emit exactly one receipt/event too.
+					await this.appendAndCommitMessage(message);
 				} else {
 					this.pendingSessionWrites.push({ type: "message", message });
 				}

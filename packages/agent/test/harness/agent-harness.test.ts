@@ -515,10 +515,18 @@ describe("AgentHarness", () => {
 		const firstResponseReleased = new Promise<void>((resolve) => {
 			releaseFirstResponse = resolve;
 		});
+		// Deterministic handshake: the provider signals when it has actually
+		// been entered, so the test can guarantee abortedSignal/releaseFirst
+		// are assigned before abort() runs (no timing assumptions at all).
+		let markProviderEntered: (() => void) | undefined;
+		const providerEntered = new Promise<void>((resolve) => {
+			markProviderEntered = resolve;
+		});
 		const secondRequestText: string[] = [];
 		registration.setResponses([
 			async (_context, options) => {
 				abortedSignal = options?.signal;
+				markProviderEntered?.();
 				await firstResponseReleased;
 				return fauxAssistantMessage("aborted-ish");
 			},
@@ -544,12 +552,11 @@ describe("AgentHarness", () => {
 		});
 
 		const firstPrompt = harness.prompt("first");
-		await new Promise((resolve) => setTimeout(resolve, 0));
+		await providerEntered; // provider is inside the first call now
 		harness.steer("steer");
 		harness.followUp("follow");
 		harness.nextTurn("next");
 		const abortResultPromise = harness.abort();
-		await new Promise((resolve) => setTimeout(resolve, 0));
 		expect(abortedSignal?.aborted).toBe(true);
 		releaseFirstResponse?.();
 		const abortResult = await abortResultPromise;

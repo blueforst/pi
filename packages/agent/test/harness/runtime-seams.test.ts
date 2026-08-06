@@ -12,6 +12,10 @@ import type { AgentMessage } from "../../src/types.ts";
 import { calculateTool } from "../utils/calculate.ts";
 import { createInMemorySession } from "./session-test-utils.ts";
 
+function createUserMessage(text: string): AgentMessage {
+	return { role: "user", content: [{ type: "text", text }], timestamp: Date.now() };
+}
+
 /**
  * Runtime seam contract tests (PI-015 / PI-016 / PI-017).
  *
@@ -217,5 +221,106 @@ describe("PI-016 Session commit receipts & PI-017 lifecycle events", () => {
 		expect(committed[0]!.toolCallId).toBe("toolcall-1");
 		expect(committed[0]!.toolName).toBe("calculate");
 		expect(committed[0]!.isError).toBe(false);
+	});
+});
+
+describe("iris_agent#40: every supported append path yields exactly one commit receipt", () => {
+	it("harness.appendMessage (idle) emits exactly one message_finalized with a receipt", async () => {
+		const session = await createInMemorySession();
+		const finalized: MessageFinalizedEvent[] = [];
+		const harness = new AgentHarness({
+			models,
+			session,
+			model: newFaux().getModel(),
+			systemPrompt: "You are helpful.",
+		});
+		harness.subscribe((event) => {
+			if (event.type === "message_finalized") finalized.push(event as MessageFinalizedEvent);
+		});
+
+		await harness.appendMessage(createUserMessage("direct append"));
+
+		expect(finalized.length).toBe(1);
+		expect(finalized[0]!.role).toBe("user");
+		expect(finalized[0]!.receipt.entryId).toBe(finalized[0]!.entryId);
+		expect(finalized[0]!.receipt.contentHash.length).toBe(64);
+		expect(finalized[0]!.receipt.sessionId).toBe((await session.getMetadata()).id);
+	});
+
+	it("pending-writes flush emits one receipt per message in real commit order", async () => {
+		const session = await createInMemorySession();
+		const registration = newFaux();
+		registration.setResponses([
+			async () => fauxAssistantMessage("first"),
+			async () => fauxAssistantMessage("second"),
+		]);
+		const finalized: MessageFinalizedEvent[] = [];
+		const harness = new AgentHarness({
+			models,
+			session,
+			model: registration.getModel(),
+			systemPrompt: "You are helpful.",
+		});
+		harness.subscribe((event) => {
+			if (event.type === "message_finalized") finalized.push(event as MessageFinalizedEvent);
+		});
+
+		// While the harness is busy, direct appends go to the pending queue.
+		const promptPromise = harness.prompt("hello");
+		await harness.appendMessage(createUserMessage("queued user message"));
+		await harness.appendMessage(createUserMessage("queued assistant note"));
+		await promptPromise;
+
+		// Agent loop (user + assistant) plus the two queued writes.
+		expect(finalized.length).toBe(4);
+		// Order is the real commit order: prompt user, assistant, queued user, queued note.
+		const texts = finalized.map((event) => textContent(event.message));
+		expect(texts).toEqual(["hello", "first", "queued user message", "queued assistant note"]);
+		// Each message got its own distinct entry and receipt.
+		const ids = finalized.map((event) => event.entryId);
+		expect(new Set(ids).size).toBe(4);
+	});
+
+	it("agent-loop messages do not double-emit after consolidation", async () => {
+		const session = await createInMemorySession();
+		const registration = newFaux();
+		registration.setResponses([async () => fauxAssistantMessage("once")]);
+		const finalized: MessageFinalizedEvent[] = [];
+		const harness = new AgentHarness({
+			models,
+			session,
+			model: registration.getModel(),
+			systemPrompt: "You are helpful.",
+		});
+		harness.subscribe((event) => {
+			if (event.type === "message_finalized") finalized.push(event as MessageFinalizedEvent);
+		});
+
+		await harness.prompt("hello");
+
+		expect(finalized.length).toBe(2);
+		const ids = finalized.map((event) => event.entryId);
+		expect(new Set(ids).size).toBe(2);
+	});
+
+	it("failed durable append produces no receipt/event (no phantom receipts)", async () => {
+		const session = await createInMemorySession();
+		session.appendMessage = (async () => {
+			throw new Error("storage failure");
+		}) as typeof session.appendMessage;
+
+		const finalized: MessageFinalizedEvent[] = [];
+		const harness = new AgentHarness({
+			models,
+			session,
+			model: newFaux().getModel(),
+			systemPrompt: "You are helpful.",
+		});
+		harness.subscribe((event) => {
+			if (event.type === "message_finalized") finalized.push(event as MessageFinalizedEvent);
+		});
+
+		await expect(harness.appendMessage(createUserMessage("will fail"))).rejects.toThrow("storage failure");
+		expect(finalized.length).toBe(0);
 	});
 });
