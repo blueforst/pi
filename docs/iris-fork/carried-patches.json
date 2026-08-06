@@ -35,7 +35,7 @@
 			"title": "Awaited Session commit receipts for appended entries",
 			"status": "carried",
 			"firstForkCommit": "310e73313cd836cde4014085577a3e46a757192c",
-			"latestForkCommit": "e209e56163fac2992e8aaf0fbcd67cb4fb663c84",
+			"latestForkCommit": "18d059bfdfcc64f75f9974ac8b15a512b2cd8d5c",
 			"genericRuntimeRationale": "Consumers of the Session archive need awaited, durable commit evidence (sessionId, entryId, content hash, optional entrySeq) to attribute messages exactly once and to reconcile crash windows; observer-only events cannot prove durability. Receipts are carried on the new message_finalized lifecycle event; the Session append API itself keeps its existing return contract. iris_agent#40 consolidates every supported append path (agent loop, direct appendMessage, pending-writes flush) onto one shared appendAndCommitMessage primitive so no valid durable append can bypass commit evidence.",
 			"affectedPackages": [
 				"@earendil-works/pi-agent-core"
@@ -52,7 +52,10 @@
 				"packages/agent/test/harness/runtime-seams.test.ts (iris_agent#40: direct appendMessage emits exactly one receipt)",
 				"packages/agent/test/harness/runtime-seams.test.ts (iris_agent#40: pending-writes flush emits one receipt per message in commit order)",
 				"packages/agent/test/harness/runtime-seams.test.ts (iris_agent#40: agent-loop does not double-emit)",
-				"packages/agent/test/harness/runtime-seams.test.ts (iris_agent#40: failed durable append produces no phantom receipt)"
+				"packages/agent/test/harness/runtime-seams.test.ts (iris_agent#40: failed durable append produces no phantom receipt)",
+				"packages/agent/test/harness/runtime-seams.test.ts (iris_agent#40 Feature 2: crash window leaves pending receipt; recovery replays exactly once with stable identity and commit order)",
+				"packages/agent/test/harness/session-backends.test.ts (JSONL journal survives simulated crash + reopen; marker lines never become entries)",
+				"packages/agent/test/harness/sqlite-node.test.ts (SQLite journal persists across restart; acked rows never re-emit)"
 			],
 			"upstream": {
 				"status": "not_filed",
@@ -61,7 +64,7 @@
 			},
 			"removalCondition": "earendil-works/pi provides awaited append receipts (or an equivalent durability contract) and iris_agent consumes the released contract.",
 			"compatibilityRisk": "low: new additive event; no existing event or API shape is modified.",
-			"notes": "entrySeq is optional because the in-memory Session abstraction does not expose the storage-layer sequence; storage backends may fill it in later. 0.83.1: message_finalized now also carries the committed message (commit evidence completeness)."
+			"notes": "entrySeq is optional because the in-memory Session abstraction does not expose the storage-layer sequence; storage backends may fill it in later. 0.83.1: message_finalized now also carries the committed message (commit evidence completeness). Feature 2 (iris_agent#40): the receipt is now crash-consistent via the durable commit journal (appendEntryWithReceipt atomic append+receipt, recoverPendingCommitReceipts replay, ackCommitReceipt) with no Iris semantics; latestForkCommit 18d059bf is the accepted runtime head."
 		},
 		{
 			"id": "PI-017-runtime-event-lifecycle",
@@ -95,7 +98,7 @@
 		{
 			"id": "PI-018-hermetic-model-catalog",
 			"title": "Hermetic, content-addressed model catalog generation",
-			"status": "proposed",
+			"status": "carried",
 			"genericRuntimeRationale": "Any runtime consumer that needs reproducible builds and typed model catalogs (e.g. identity-level Context engines that pin the accepted runtime) must not have normal build/check/test depend on mutable third-party model catalogs (models.dev, NVIDIA NIM, OpenRouter, Vercel AI Gateway). The fork commits the content-addressed model snapshot (per-file sha256 + structureHash + source provenance) and regenerates TypeScript shards/aggregator offline from it; live refresh is an explicit, separately reviewed command. Tests no longer reference transient catalog member IDs.",
 			"affectedPackages": [
 				"@earendil-works/pi-ai"
@@ -123,7 +126,42 @@
 			},
 			"removalCondition": "earendil-works/pi ships a hermetic, content-addressed model catalog generation path (or drops live-fetch generation from the normal build) with equivalent reproducibility gates.",
 			"compatibilityRisk": "low: normal build output is byte-identical to the committed snapshot; live refresh remains available as an explicit command.",
-			"notes": "Models snapshot generated 2026-08-06 from live upstreams with sources[] provenance in .manifest.json. PI_*_URL environment variables allow failure-matrix testing; refresh path honors HTTPS_PROXY via undici ProxyAgent. Status proposed because acceptedRuntime has not advanced past this change yet; promotion to carried happens with the accepted-runtime advancement (iris_agent#41 / Feature 3)."
+			"notes": "Models snapshot generated 2026-08-06 from live upstreams with sources[] provenance in .manifest.json. PI_*_URL environment variables allow failure-matrix testing; refresh path honors HTTPS_PROXY via undici ProxyAgent. Promoted to carried with the accepted-runtime advancement (iris_agent#41 / Feature 3); firstForkCommit 3d222542b is the generation fix, latestForkCommit 97b37bbbc is the registry commit carrying this patch into the accepted runtime 18d059bf.",
+			"firstForkCommit": "3d222542b697d9e581834e70367b13bf954b3570",
+			"latestForkCommit": "97b37bbbc8a00564beaac469e54838403369cf5e"
+		},
+		{
+			"id": "PI-019-crash-consistent-commit-receipts",
+			"title": "Crash-consistent SessionCommitReceipt journal (durable receipt outbox)",
+			"status": "carried",
+			"firstForkCommit": "f5e434c9c407e6afd791fa5e9e927244d864ce02",
+			"latestForkCommit": "18d059bfdfcc64f75f9974ac8b15a512b2cd8d5c",
+			"genericRuntimeRationale": "Any runtime consumer that attributes committed messages exactly once needs the durable append and the receipt to survive a crash between the append and the lifecycle publication. A generic commit journal (optional SessionStorage appendEntryWithReceipt recording the entry and its pending receipt atomically, readPendingCommitReceipts, ackCommitReceipt) lets a restarting harness replay missed message_finalized events without re-appending (no duplicate semantic commit) and with stable receipt identity (sessionId + entryId + contentHash). No Iris Context/Historian/Memory semantics enter Pi.",
+			"affectedPackages": [
+				"@earendil-works/pi-agent-core",
+				"@earendil-works/pi-storage-sqlite-node"
+			],
+			"affectedSurfaces": [
+				"SessionStorage optional journal methods (appendEntryWithReceipt / readPendingCommitReceipts / ackCommitReceipt)",
+				"Session.appendMessageWithCommitReceipt",
+				"AgentHarness.recoverPendingCommitReceipts",
+				"JSONL journal marker lines (__piReceipt / __piReceiptAck)",
+				"SQLite migration 003_commit_receipts.sql"
+			],
+			"tests": [
+				"packages/agent/test/harness/runtime-seams.test.ts (crash window / replay exactly once / commit order / no phantom receipts)",
+				"packages/agent/test/harness/session-backends.test.ts (JSONL crash+reopen replay; marker lines skipped; marker-text entries never dropped)",
+				"packages/agent/test/harness/sqlite-node.test.ts (SQLite restart replay; ack persistence)",
+				"packages/agent/test/harness/sqlite-migrations.test.ts (migration 003 recorded forward-only)"
+			],
+			"upstream": {
+				"status": "not_filed",
+				"issue": null,
+				"pullRequest": null
+			},
+			"removalCondition": "earendil-works/pi provides an equivalent crash-consistent commit/outbox mechanism and iris_agent consumes the released contract.",
+			"compatibilityRisk": "low: journal methods are optional; backends without a journal degrade to the plain append path unchanged.",
+			"notes": "First review round found and fixed a marker-line substring false positive (18d059bf structural detection). Replay never re-appends and never re-runs afterAppend, so it cannot duplicate semantic commits."
 		}
 	]
 }

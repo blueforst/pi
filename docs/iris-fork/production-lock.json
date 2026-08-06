@@ -7,11 +7,11 @@
 	},
 	"acceptedRuntime": {
 		"repository": "blueforst/pi",
-		"commit": "e209e56163fac2992e8aaf0fbcd67cb4fb663c84",
-		"tree": "771b1634ac4a257b1fce2318966cf4400f5af4c2",
-		"verifiedAt": "2026-08-05",
+		"commit": "18d059bfdfcc64f75f9974ac8b15a512b2cd8d5c",
+		"tree": "c7b8aa847d8a9141e0620fe797dbafe6fd83802f",
+		"verifiedAt": "2026-08-06",
 		"equivalentCommit": "47f85a370a30a34a1e1c4533902f33818651d1b0",
-		"notes": "e209e561 is the accepted fork head containing the iris_agent#40 appendAndCommitMessage commit-receipt consolidation plus the iris_agent#41 production-lock fix chain. Its tree is the immutable identity consumers must verify. Prior accepted identity 47f85a37 is an ancestor. acceptedRuntime is the single authoritative identity for the Pi runtime iris_agent is allowed to consume; floating main is never an accepted identity."
+		"notes": "18d059bf is the accepted fork head containing the iris_agent#40 crash-consistent commit journal (Feature 2: appendEntryWithReceipt atomic append+receipt, recoverPendingCommitReceipts replay, SQLite migration 003) on top of the iris_agent#44 hermetic model catalog (Feature 1: content-addressed committed snapshot, --from-data offline generation, consistency gates) and the earlier #40 appendAndCommitMessage consolidation plus the #41 production-lock fix chain. Its tree is the immutable identity consumers must verify. Prior accepted identity 47f85a37 is an ancestor. acceptedRuntime is the single authoritative identity for the Pi runtime iris_agent is allowed to consume; floating main is never an accepted identity."
 	},
 	"upstream": {
 		"repository": "earendil-works/pi",
