@@ -295,4 +295,136 @@ describe("SQLite crash-consistent commit journal (iris_agent#40 Feature 2)", () 
 		expect(await harness.recoverPendingCommitReceipts()).toBe(0);
 		expect(finalized.length).toBe(1);
 	});
+
+	it("iris_agent#50: receipts sharing one committed_at replay in exact append order (authoritative receipt_seq)", async () => {
+		const root = createTempDir();
+		const env = new NodeExecutionEnv({ cwd: root });
+		const databasePath = join(root, "sessions.sqlite");
+		const sqlite = createNodeSqliteFactory();
+
+		const repo = new SqliteSessionRepository({ env, sqlite, databasePath });
+		const session = await repo.create({ cwd: root, id: "session-ms-tie" });
+		const metadata = await session.getMetadata();
+		const sameTimestamp = "2026-08-07T00:00:00.000Z";
+		const texts = ["first", "second", "third"];
+		const entryIds: string[] = [];
+		for (const text of texts) {
+			const message = createUserMessage(text);
+			const contentHash = await computeMessageContentHash(message);
+			const { entryId } = await session.appendMessageWithCommitReceipt(message, (id) => ({
+				sessionId: metadata.id,
+				entryId: id,
+				contentHash,
+				committedAt: sameTimestamp, // identical millisecond timestamp
+			}));
+			entryIds.push(entryId);
+		}
+		await repo[Symbol.asyncDispose]();
+
+		// Restart and replay: order must follow receipt_seq (append order),
+		// NOT committed_at (all identical) and NOT entry_id (opaque).
+		const reopenedRepo = new SqliteSessionRepository({ env, sqlite, databasePath });
+		ownedRepositories.push(reopenedRepo);
+		const reopened = await reopenedRepo.open(metadata);
+		const pending = await reopened.readPendingCommitReceipts();
+		expect(pending.map((receipt) => receipt.entryId)).toEqual(entryIds);
+		expect(pending.map((receipt) => receipt.entrySeq)).toEqual([1, 2, 3]);
+
+		const finalized: MessageFinalizedEvent[] = [];
+		const harness = new AgentHarness({
+			models,
+			session: reopened as unknown as Session,
+			model: newFaux().getModel(),
+			systemPrompt: "You are helpful.",
+		});
+		harness.subscribe((event) => {
+			if (event.type === "message_finalized") finalized.push(event as MessageFinalizedEvent);
+		});
+		expect(await harness.recoverPendingCommitReceipts()).toBe(3);
+		expect(finalized.map((event) => event.entryId)).toEqual(entryIds);
+	});
+
+	it("iris_agent#50: a tampered persisted receipt is quarantined, never emitted, never acked; valid receipts still emit", async () => {
+		const root = createTempDir();
+		const env = new NodeExecutionEnv({ cwd: root });
+		const databasePath = join(root, "sessions.sqlite");
+		const sqlite = createNodeSqliteFactory();
+
+		// Process 1: three committed messages with pending receipts (crash
+		// window), using REAL canonical hashes.
+		const repo = new SqliteSessionRepository({ env, sqlite, databasePath });
+		const session = await repo.create({ cwd: root, id: "session-tamper" });
+		const metadata = await session.getMetadata();
+		const messages = [createUserMessage("first"), createUserMessage("second"), createUserMessage("third")];
+		const hashes = await Promise.all(messages.map((message) => computeMessageContentHash(message)));
+		const entryIds: string[] = [];
+		for (let i = 0; i < messages.length; i++) {
+			const { entryId } = await session.appendMessageWithCommitReceipt(messages[i]!, (id) => ({
+				sessionId: metadata.id,
+				entryId: id,
+				contentHash: hashes[i]!,
+				committedAt: new Date().toISOString(),
+			}));
+			entryIds.push(entryId);
+		}
+		await repo[Symbol.asyncDispose]();
+
+		// Tamper the SECOND receipt's content hash directly in the database
+		// (simulates a corrupted/tampered persisted row).
+		const tamperDb = await sqlite.open(databasePath);
+		await tamperDb
+			.prepare("UPDATE session_commit_receipts SET content_hash = ? WHERE session_id = ? AND entry_id = ?")
+			.run("f".repeat(64), metadata.id, entryIds[1]);
+		await tamperDb.close();
+
+		// Process 2: recovery must emit 2/3 (valid ones), quarantine the
+		// tampered one with a typed reason, and never ack it.
+		const reopenedRepo = new SqliteSessionRepository({ env, sqlite, databasePath });
+		ownedRepositories.push(reopenedRepo);
+		const reopened = await reopenedRepo.open(metadata);
+		const finalized: MessageFinalizedEvent[] = [];
+		const harness = new AgentHarness({
+			models,
+			session: reopened as unknown as Session,
+			model: newFaux().getModel(),
+			systemPrompt: "You are helpful.",
+		});
+		harness.subscribe((event) => {
+			if (event.type === "message_finalized") finalized.push(event as MessageFinalizedEvent);
+		});
+
+		expect(await harness.recoverPendingCommitReceipts()).toBe(2);
+		expect(finalized.map((event) => event.entryId)).toEqual([entryIds[0], entryIds[2]]);
+
+		// Quarantined row visible in health diagnostics with typed reason.
+		const quarantined = await reopened.readQuarantinedCommitReceipts();
+		expect(quarantined.length).toBe(1);
+		expect(quarantined[0]!.entryId).toBe(entryIds[1]);
+		expect(quarantined[0]!.reason).toContain("content_hash_mismatch");
+
+		// Retry/restart idempotent: second recovery replays nothing new and
+		// the tampered row stays quarantined (never re-emitted, never acked).
+		expect(await harness.recoverPendingCommitReceipts()).toBe(0);
+		expect(finalized.length).toBe(2);
+		expect(await reopened.readPendingCommitReceipts()).toEqual([]);
+		expect((await reopened.readQuarantinedCommitReceipts()).length).toBe(1);
+
+		// Third process: quarantine persists across restart.
+		const thirdRepo = new SqliteSessionRepository({ env, sqlite, databasePath });
+		ownedRepositories.push(thirdRepo);
+		const third = await thirdRepo.open(metadata);
+		const thirdHarness = new AgentHarness({
+			models,
+			session: third as unknown as Session,
+			model: newFaux().getModel(),
+			systemPrompt: "You are helpful.",
+		});
+		const thirdFinalized: MessageFinalizedEvent[] = [];
+		thirdHarness.subscribe((event) => {
+			if (event.type === "message_finalized") thirdFinalized.push(event as MessageFinalizedEvent);
+		});
+		expect(await thirdHarness.recoverPendingCommitReceipts()).toBe(0);
+		expect(thirdFinalized.length).toBe(0);
+		expect((await third.readQuarantinedCommitReceipts()).length).toBe(1);
+	});
 });

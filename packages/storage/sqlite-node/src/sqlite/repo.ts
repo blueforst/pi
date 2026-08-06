@@ -233,10 +233,22 @@ class SqliteSessionBackend {
 			appendEntryWithReceipt: (entry, receipt) => this.appendEntryWithReceipt(metadata, entry, receipt),
 			readPendingCommitReceipts: () => this.read(metadata, (current) => current.readPendingCommitReceipts()),
 			ackCommitReceipt: (entryId) => this.ackCommitReceipt(metadata, entryId),
+			quarantineCommitReceipt: (entryId, reason) => this.quarantineCommitReceipt(metadata, entryId, reason),
+			readQuarantinedCommitReceipts: () => this.read(metadata, (current) => current.readQuarantinedCommitReceipts()),
 			// The entry insert and the receipt row commit in one SQLite
 			// transaction (WAL + synchronous=FULL): an explicit durability boundary.
 			supportsCrashRecoverableReceipts: () => true,
 		};
+	}
+
+	private quarantineCommitReceipt(metadata: SqliteSessionMetadata, entryId: string, reason: string): Promise<void> {
+		this.assertOpen();
+		return this.operations.enqueue(async () => {
+			const connection =
+				this.writers.get(metadata.id) ?? (await SqliteSessionConnection.open(await this.getDatabase(), metadata));
+			this.writers.set(metadata.id, connection);
+			await connection.quarantineCommitReceipt(entryId, reason);
+		});
 	}
 
 	private appendEntryWithReceipt(

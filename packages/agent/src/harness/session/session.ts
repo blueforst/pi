@@ -11,6 +11,7 @@ import type {
 	LeafEntry,
 	MessageEntry,
 	ModelChangeEntry,
+	QuarantinedCommitReceipt,
 	SessionBranchQuery,
 	SessionCommitReceipt,
 	SessionContext,
@@ -329,6 +330,16 @@ export class Session<TMetadata extends SessionMetadata = SessionMetadata> {
 	/** Marks a commit receipt as published; crash recovery skips it afterwards. */
 	async ackCommitReceipt(entryId: string): Promise<void> {
 		await this.storage.ackCommitReceipt?.(entryId);
+	}
+
+	/** iris_agent#50: permanently quarantine an integrity-failed receipt. */
+	async quarantineCommitReceipt(entryId: string, reason: string): Promise<void> {
+		await this.storage.quarantineCommitReceipt?.(entryId, reason);
+	}
+
+	/** iris_agent#50: quarantined receipts (health diagnostics; never re-emitted). */
+	async readQuarantinedCommitReceipts(): Promise<readonly QuarantinedCommitReceipt[]> {
+		return (await this.storage.readQuarantinedCommitReceipts?.()) ?? [];
 	}
 
 	/**

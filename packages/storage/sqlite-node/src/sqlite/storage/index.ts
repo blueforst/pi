@@ -1,4 +1,5 @@
 import type {
+	QuarantinedCommitReceipt,
 	SessionBranchQuery,
 	SessionCommitReceipt,
 	SessionEntryCursorOptions,
@@ -365,7 +366,13 @@ export class SqliteSessionConnection {
 		return { leafId: row.active_leaf_id };
 	}
 
-	async appendEntry(entry: SessionTreeEntry, options: { transaction?: boolean } = {}): Promise<void> {
+	/**
+	 * Appends the entry and returns its durable entry_seq (the authoritative
+	 * per-session append order, allocated from session_sequences). Callers
+	 * that persist derived rows (e.g. the commit receipt journal) MUST use
+	 * the returned sequence as their ordering key.
+	 */
+	async appendEntry(entry: SessionTreeEntry, options: { transaction?: boolean } = {}): Promise<number> {
 		if (entry.type === "leaf" && entry.targetId !== null && !(await this.readEntry(entry.targetId))) {
 			throw new SessionError("not_found", `Entry ${entry.targetId} not found`);
 		}
@@ -379,8 +386,10 @@ export class SqliteSessionConnection {
 		const nextLeafId = leafIdAfterEntry(entry);
 		try {
 			applyEntryToMaterializedState(nextMaterializedState, entry);
+			let committedSeq = 0;
 			const write = async () => {
 				const nextSeq = await getNextSequence(this.db, this.metadata.id);
+				committedSeq = nextSeq;
 				await this.db
 					.prepare(
 						"INSERT INTO session_entries (session_id, id, entry_seq, parent_id, type, timestamp, payload) VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -413,6 +422,7 @@ export class SqliteSessionConnection {
 			else await this.db.transaction(write);
 			this.materializedState = nextMaterializedState;
 			this.byId.set(entry.id, entry);
+			return committedSeq;
 		} catch (error) {
 			if (error instanceof SessionError) throw error;
 			throw new SessionError("storage", `Failed to append SQLite session entry ${entry.id}`, toError(error));
@@ -425,30 +435,37 @@ export class SqliteSessionConnection {
 	 * between the durable append and the `message_finalized` publication
 	 * leaves a recoverable pending receipt. The harness acknowledges the
 	 * receipt after publication; unacknowledged rows are replayed on restart.
+	 *
+	 * iris_agent#50: the receipt row carries the entry's authoritative
+	 * entry_seq as receipt_seq (same transaction, so it IS the commit order).
+	 * Replay orders by receipt_seq; timestamps are diagnostics only.
 	 */
 	async appendEntryWithReceipt(entry: SessionTreeEntry, receipt: SessionCommitReceipt): Promise<void> {
 		await this.db.transaction(async () => {
-			await this.appendEntry(entry, { transaction: false });
+			const entrySeq = await this.appendEntry(entry, { transaction: false });
 			await this.db
 				.prepare(
-					"INSERT INTO session_commit_receipts (session_id, entry_id, content_hash, committed_at, acked) VALUES (?, ?, ?, ?, 0)",
+					"INSERT INTO session_commit_receipts (session_id, entry_id, content_hash, committed_at, acked, receipt_seq) VALUES (?, ?, ?, ?, 0, ?)",
 				)
-				.run(this.metadata.id, receipt.entryId, receipt.contentHash, receipt.committedAt);
+				.run(this.metadata.id, receipt.entryId, receipt.contentHash, receipt.committedAt, entrySeq);
 		});
 	}
 
-	/** Pending (recorded, not yet acknowledged) receipts in commit order. */
+	/** Pending (recorded, not yet acknowledged) receipts in authoritative
+	 * commit order (iris_agent#50: ORDER BY receipt_seq; committed_at and
+	 * entry_id are NOT ordering keys). */
 	async readPendingCommitReceipts(): Promise<readonly SessionCommitReceipt[]> {
 		const rows = await this.db
 			.prepare(
-				"SELECT entry_id, content_hash, committed_at FROM session_commit_receipts WHERE session_id = ? AND acked = 0 ORDER BY committed_at, entry_id",
+				"SELECT entry_id, content_hash, committed_at, receipt_seq FROM session_commit_receipts WHERE session_id = ? AND acked = 0 ORDER BY receipt_seq",
 			)
-			.all<{ entry_id: string; content_hash: string; committed_at: string }>(this.metadata.id);
+			.all<{ entry_id: string; content_hash: string; committed_at: string; receipt_seq: number }>(this.metadata.id);
 		return rows.map((row) => ({
 			sessionId: this.metadata.id,
 			entryId: row.entry_id,
 			contentHash: row.content_hash,
 			committedAt: row.committed_at,
+			entrySeq: row.receipt_seq,
 		}));
 	}
 
@@ -457,6 +474,42 @@ export class SqliteSessionConnection {
 		await this.db
 			.prepare("UPDATE session_commit_receipts SET acked = 1 WHERE session_id = ? AND entry_id = ?")
 			.run(this.metadata.id, entryId);
+	}
+
+	/**
+	 * iris_agent#50: permanently quarantine a receipt that failed recovery
+	 * integrity validation (acked = 2 + typed reason). Quarantined rows are
+	 * never emitted and never acked; they stay visible via
+	 * readQuarantinedCommitReceipts and are skipped by every recovery pass.
+	 */
+	async quarantineCommitReceipt(entryId: string, reason: string): Promise<void> {
+		await this.db
+			.prepare(
+				"UPDATE session_commit_receipts SET acked = 2, quarantine_reason = ? WHERE session_id = ? AND entry_id = ?",
+			)
+			.run(reason, this.metadata.id, entryId);
+	}
+
+	/** iris_agent#50: quarantined receipts in commit order (health diagnostics). */
+	async readQuarantinedCommitReceipts(): Promise<readonly QuarantinedCommitReceipt[]> {
+		const rows = await this.db
+			.prepare(
+				"SELECT entry_id, content_hash, committed_at, receipt_seq, quarantine_reason FROM session_commit_receipts WHERE session_id = ? AND acked = 2 ORDER BY receipt_seq",
+			)
+			.all<{
+				entry_id: string;
+				content_hash: string;
+				committed_at: string;
+				receipt_seq: number;
+				quarantine_reason: string;
+			}>(this.metadata.id);
+		return rows.map((row) => ({
+			entryId: row.entry_id,
+			reason: row.quarantine_reason,
+			contentHash: row.content_hash,
+			committedAt: row.committed_at,
+			entrySeq: row.receipt_seq,
+		}));
 	}
 
 	async readEntry(id: string): Promise<SessionTreeEntry | undefined> {

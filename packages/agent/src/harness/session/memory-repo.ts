@@ -1,4 +1,5 @@
 import type {
+	QuarantinedCommitReceipt,
 	SessionCommitReceipt,
 	SessionForkOptions,
 	SessionForkSelection,
@@ -25,6 +26,10 @@ interface InMemorySessionState {
 	entries: ArraySessionIndex;
 	/** Crash-consistent commit journal: entryId -> pending receipt (commit order). */
 	pendingReceipts: SessionCommitReceipt[];
+	/** iris_agent#50: monotonic commit sequence (never reused after ack). */
+	nextCommitSeq: number;
+	/** iris_agent#50: entryId -> quarantined receipt (integrity-failed, never emitted). */
+	quarantinedReceipts: Map<string, { receipt: QuarantinedCommitReceipt; order: number }>;
 }
 
 export class InMemorySessionBackend {
@@ -41,6 +46,8 @@ export class InMemorySessionBackend {
 				metadata: { id, createdAt: createTimestamp() },
 				entries: new ArraySessionIndex(),
 				pendingReceipts: [],
+				nextCommitSeq: 0,
+				quarantinedReceipts: new Map(),
 			};
 			this.sessions.set(id, state);
 			return this.storage(state);
@@ -79,6 +86,8 @@ export class InMemorySessionBackend {
 				metadata: { id, createdAt: createTimestamp() },
 				entries: new ArraySessionIndex(await sourceEntries),
 				pendingReceipts: [],
+				nextCommitSeq: 0,
+				quarantinedReceipts: new Map(),
 			};
 			this.sessions.set(id, state);
 			return this.storage(state);
@@ -112,6 +121,8 @@ export class InMemorySessionBackend {
 			appendEntryWithReceipt: (entry, receipt) => this.appendEntryWithReceipt(state.metadata, entry, receipt),
 			readPendingCommitReceipts: () => this.readPendingCommitReceipts(state.metadata),
 			ackCommitReceipt: (entryId) => this.ackCommitReceipt(state.metadata, entryId),
+			quarantineCommitReceipt: (entryId, reason) => this.quarantineCommitReceipt(state.metadata, entryId, reason),
+			readQuarantinedCommitReceipts: () => this.readQuarantinedCommitReceipts(state.metadata),
 			// In-memory ordering is the commit order; the journal is trivially
 			// atomic within the KeyedOperationQueue (serialization, no crash
 			// boundary — declared supported because ordering/identity are exact).
@@ -128,13 +139,21 @@ export class InMemorySessionBackend {
 		return this.operations.enqueue(metadata.id, () => {
 			const state = this.getState(metadata);
 			state.entries.append(entry);
-			state.pendingReceipts.push(receipt);
+			// iris_agent#50: allocate an authoritative monotonic commit sequence
+			// in the same journal op as the entry; never reused after ack.
+			const seq = ++state.nextCommitSeq;
+			const sequenced: SessionCommitReceipt = { ...receipt, entrySeq: seq };
+			state.pendingReceipts.push(sequenced);
 		});
 	}
 
 	private readPendingCommitReceipts(metadata: SessionMetadata): Promise<readonly SessionCommitReceipt[]> {
 		this.assertOpen();
-		return this.operations.enqueue(metadata.id, () => [...this.getState(metadata).pendingReceipts]);
+		return this.operations.enqueue(metadata.id, () =>
+			// iris_agent#50: same deterministic ordering contract as SQLite
+			// (ORDER BY commit sequence) and JSONL (frame seq).
+			[...this.getState(metadata).pendingReceipts].sort((a, b) => (a.entrySeq ?? 0) - (b.entrySeq ?? 0)),
+		);
 	}
 
 	private ackCommitReceipt(metadata: SessionMetadata, entryId: string): Promise<void> {
@@ -143,6 +162,37 @@ export class InMemorySessionBackend {
 			const state = this.getState(metadata);
 			state.pendingReceipts = state.pendingReceipts.filter((receipt) => receipt.entryId !== entryId);
 		});
+	}
+
+	/** iris_agent#50: permanently quarantine an integrity-failed receipt. */
+	private quarantineCommitReceipt(metadata: SessionMetadata, entryId: string, reason: string): Promise<void> {
+		this.assertOpen();
+		return this.operations.enqueue(metadata.id, () => {
+			const state = this.getState(metadata);
+			const pending = state.pendingReceipts.find((receipt) => receipt.entryId === entryId);
+			if (pending === undefined) return; // already acked or already quarantined: idempotent
+			state.pendingReceipts = state.pendingReceipts.filter((receipt) => receipt.entryId !== entryId);
+			state.quarantinedReceipts.set(entryId, {
+				receipt: {
+					entryId,
+					reason,
+					...(pending.contentHash !== undefined ? { contentHash: pending.contentHash } : {}),
+					...(pending.committedAt !== undefined ? { committedAt: pending.committedAt } : {}),
+					...(pending.entrySeq !== undefined ? { entrySeq: pending.entrySeq } : {}),
+				},
+				order: pending.entrySeq ?? 0,
+			});
+		});
+	}
+
+	/** iris_agent#50: quarantined receipts in commit order (health diagnostics). */
+	private readQuarantinedCommitReceipts(metadata: SessionMetadata): Promise<readonly QuarantinedCommitReceipt[]> {
+		this.assertOpen();
+		return this.operations.enqueue(metadata.id, () =>
+			[...this.getState(metadata).quarantinedReceipts.values()]
+				.sort((a, b) => a.order - b.order)
+				.map((entry) => entry.receipt),
+		);
 	}
 
 	private appendEntry(metadata: SessionMetadata, entry: SessionTreeEntry): Promise<void> {
