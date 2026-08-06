@@ -194,10 +194,13 @@ async function loadJsonlSession(fs: JsonlSessionFileSystem, path: string): Promi
 			diagnostics.push(`torn_tail: line ${lineNumber}: ${message}; quarantined`);
 			// Byte offset of the LAST COMPLETE line: the torn line is the
 			// suffix of the file (possibly followed by its own trailing
-			// newline). The backend truncates to this offset so the torn
-			// bytes can never become a mid-file corruption after later
-			// appends (review finding, iris_agent#51).
-			tornTailCleanLength = content.length - line.length - (content.endsWith("\n") ? 1 : 0);
+			// newline). JS strings are UTF-16 but the filesystem truncates
+			// in UTF-8 BYTES, so the clean prefix must be re-encoded before
+			// computing the offset — otherwise non-ASCII content (e.g. CJK
+			// message text) makes the truncation land inside the previous
+			// committed line and corrupt it (review finding, iris_agent#51).
+			const cleanPrefix = content.slice(0, content.length - line.length - (content.endsWith("\n") ? 1 : 0));
+			tornTailCleanLength = new TextEncoder().encode(cleanPrefix).byteLength;
 			return true;
 		};
 
@@ -228,8 +231,15 @@ async function loadJsonlSession(fs: JsonlSessionFileSystem, path: string): Promi
 		}
 		if (record.__piReceiptAck === true) {
 			const entryId = (record as { entryId?: unknown }).entryId;
-			if (typeof entryId !== "string" || !entryId)
+			if (typeof entryId !== "string" || !entryId) {
+				// A torn write can truncate the ack marker after `true}` but
+				// before the entryId field: the line still parses as valid
+				// JSON yet is structurally incomplete. As the tail it
+				// quarantines (ack loss only re-replays an already-published
+				// receipt — idempotent); mid-file it is corruption.
+				if (quarantineTail("receipt ack marker is missing entryId")) continue;
 				throw invalidEntry(path, lineNumber, "receipt ack marker is missing entryId");
+			}
 			const index = pendingReceipts.findIndex((p) => p.receipt.entryId === entryId);
 			if (index >= 0) pendingReceipts.splice(index, 1);
 			continue;
@@ -254,7 +264,18 @@ async function loadJsonlSession(fs: JsonlSessionFileSystem, path: string): Promi
 			continue;
 		}
 		// Bare entry line (plain append path, pre-framing journals, forks).
-		const entry = parseEntry(line, path, lineNumber);
+		let entry: SessionTreeEntry;
+		try {
+			entry = parseEntry(line, path, lineNumber);
+		} catch (error) {
+			// A torn write can truncate a bare entry at a JSON boundary that
+			// still parses yet is structurally incomplete (e.g. missing id).
+			// As the tail it quarantines; mid-file it is corruption.
+			if (error instanceof SessionError && error.code === "invalid_entry" && quarantineTail(error.message)) {
+				continue;
+			}
+			throw error;
+		}
 		if (entryIds.has(entry.id)) throw invalidSession(path, `duplicate entry id ${entry.id}`);
 		entryIds.add(entry.id);
 		entries.push(entry);
@@ -520,7 +541,11 @@ export class JsonlSessionBackend {
 				await this.fs.truncateFile(metadata.path, document.tornTailCleanLength),
 				`Failed to repair torn tail of ${metadata.path}`,
 			);
+			// The load's tailEndsWithNewline was computed BEFORE the truncate
+			// (stale `false`); after repair the file ends with the previous
+			// line's newline, so the append guard must see `true`.
 			this.newlineTailsByPath.set(metadata.path, true);
+			return { ...document, tailEndsWithNewline: true };
 		}
 		return document;
 	}

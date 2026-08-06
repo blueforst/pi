@@ -359,6 +359,158 @@ describe("JSONL framed journal crash-safety (iris_agent#51)", () => {
 		}
 	});
 
+	it("torn ack marker tail (valid JSON, missing entryId) quarantines instead of bricking the session", async () => {
+		const root = createTempDir();
+		const fs = new NodeExecutionEnv({ cwd: root });
+		const repo = new JsonlSessionRepository({ fs, sessionsRoot: root });
+		const session = await repo.create({ cwd: root, id: "ack-torn" });
+		const metadata = await session.getMetadata();
+		const message = createUserMessage("acked pair");
+		const contentHash = await computeMessageContentHash(message);
+		const { entryId } = await session.appendMessageWithCommitReceipt(message, (id) => receiptFor(id, contentHash));
+		await session.ackCommitReceipt(entryId);
+		const sessionPath = metadata.path;
+		await repo[Symbol.asyncDispose]();
+
+		// Simulate a crash mid-ack-write: the marker was truncated after
+		// `true}` but before the entryId field — still valid JSON, structurally
+		// incomplete. As the tail it must quarantine with a typed diagnostic
+		// (the ack is lost; re-replay is idempotent), not brick the session.
+		const full = readFileSync(sessionPath, "utf8");
+		const ackLine = full.split("\n").find((l) => l.includes("__piReceiptAck"))!;
+		const ackStart = full.indexOf(ackLine);
+		writeFileSync(sessionPath, full.slice(0, ackStart + ackLine.indexOf("entryId")));
+
+		const { session: reopened, repo: reopenedRepo } = await openSessionFile(sessionPath);
+		// The committed pair is intact; the quarantined ack re-exposes the
+		// pending receipt (idempotent re-replay semantics).
+		expect((await reopened.getEntries()).length).toBe(1);
+		const pending = await reopened.readPendingCommitReceipts();
+		expect(pending.length).toBe(1);
+		expect(pending[0]!.entryId).toBe(entryId);
+		const diagnostics = await reopened.journalDiagnostics();
+		expect(diagnostics.length).toBeGreaterThan(0);
+		expect(diagnostics[0]!).toContain("torn_tail");
+		await reopenedRepo[Symbol.asyncDispose]();
+
+		// The file was physically repaired; a fresh reopen is clean.
+		const repaired = readFileSync(sessionPath, "utf8");
+		expect(repaired.endsWith("\n")).toBe(true);
+		expect(repaired).not.toContain("__piReceiptAck");
+	});
+
+	it("non-ASCII (CJK) content: torn-tail repair truncates at UTF-8 byte boundary, never corrupts the committed frame (review D2)", async () => {
+		const root = createTempDir();
+		const fs = new NodeExecutionEnv({ cwd: root });
+		const repo = new JsonlSessionRepository({ fs, sessionsRoot: root });
+		const session = await repo.create({ cwd: root, id: "cjk-torn" });
+		const metadata = await session.getMetadata();
+		const first = createUserMessage("第一帧：中文内容 unicode 多字节，必须毫发无损");
+		const second = createUserMessage("第二帧：也会被截断");
+		const hash1 = await computeMessageContentHash(first);
+		const hash2 = await computeMessageContentHash(second);
+		await session.appendMessageWithCommitReceipt(first, (id) => receiptFor(id, hash1));
+		await session.appendMessageWithCommitReceipt(second, (id) => receiptFor(id, hash2));
+		const sessionPath = metadata.path;
+		await repo[Symbol.asyncDispose]();
+
+		// Crash mid-frame2 with CJK bytes present BEFORE the torn tail: a
+		// UTF-16-vs-byte misaligned truncate would land inside frame1.
+		const full = readFileSync(sessionPath, "utf8");
+		const lines = full.split("\n");
+		const frame2Start = full.indexOf(lines[2]!);
+		writeFileSync(sessionPath, full.slice(0, frame2Start + Math.floor(lines[2]!.length * 0.4)));
+
+		// Reopen: frame1 (CJK intact) recovers; the file is repaired at the
+		// correct byte offset.
+		{
+			const { session: reopened, repo: reopenedRepo } = await openSessionFile(sessionPath);
+			const entries = await reopened.getEntries();
+			expect(entries.length).toBe(1);
+			const text = (entries[0] as { message: { content: Array<{ text: string }> } }).message.content[0]!.text;
+			expect(text).toBe("第一帧：中文内容 unicode 多字节，必须毫发无损");
+			const pending = await reopened.readPendingCommitReceipts();
+			expect(pending.length).toBe(1);
+			expect(pending[0]!.contentHash).toBe(hash1);
+			await reopenedRepo[Symbol.asyncDispose]();
+		}
+
+		// Append after the repair: reopen must be clean and both pairs intact.
+		{
+			const { session: reopened, repo: reopenedRepo } = await openSessionFile(sessionPath);
+			const third = createUserMessage("第三帧 after CJK repair");
+			const hash3 = await computeMessageContentHash(third);
+			await reopened.appendMessageWithCommitReceipt(third, (id) => receiptFor(id, hash3));
+			expect((await reopened.getEntries()).length).toBe(2);
+			await reopenedRepo[Symbol.asyncDispose]();
+		}
+		{
+			const { session: reopened, repo: reopenedRepo } = await openSessionFile(sessionPath);
+			expect((await reopened.getEntries()).length).toBe(2);
+			const text = ((await reopened.getEntries())[0] as { message: { content: Array<{ text: string }> } }).message
+				.content[0]!.text;
+			expect(text).toBe("第一帧：中文内容 unicode 多字节，必须毫发无损");
+			expect(await reopened.journalDiagnostics()).toEqual([]);
+			await reopenedRepo[Symbol.asyncDispose]();
+		}
+	});
+
+	it("torn bare entry tail (valid JSON, structurally incomplete) quarantines instead of bricking the session (review F3)", async () => {
+		const root = createTempDir();
+		const fs = new NodeExecutionEnv({ cwd: root });
+		const repo = new JsonlSessionRepository({ fs, sessionsRoot: root });
+		const session = await repo.create({ cwd: root, id: "bare-torn" });
+		const metadata = await session.getMetadata();
+		const message = createUserMessage("plain entry before torn bare tail");
+		const contentHash = await computeMessageContentHash(message);
+		await session.appendMessageWithCommitReceipt(message, (id) => receiptFor(id, contentHash));
+		const sessionPath = metadata.path;
+		await repo[Symbol.asyncDispose]();
+
+		// Crash mid-write of a BARE entry (plain append path): the line is
+		// truncated to valid JSON that is structurally incomplete (here: a
+		// leaf without id/targetId — parseEntry's structural checks fail).
+		// As the tail it must quarantine with a typed diagnostic, not throw
+		// invalid_entry and brick the session.
+		const full = readFileSync(sessionPath, "utf8");
+		writeFileSync(sessionPath, `${full}${JSON.stringify({ type: "leaf" })}`);
+
+		const { session: reopened, repo: reopenedRepo } = await openSessionFile(sessionPath);
+		// The committed frame survives; the torn bare entry is quarantined.
+		expect((await reopened.getEntries()).length).toBe(1);
+		const diagnostics = await reopened.journalDiagnostics();
+		expect(diagnostics.length).toBeGreaterThan(0);
+		expect(diagnostics[0]!).toContain("torn_tail");
+		// A follow-up append works and the file stays healthy.
+		await reopened.appendMessageWithCommitReceipt(createUserMessage("after torn bare tail"), (id) =>
+			receiptFor(id, contentHash),
+		);
+		await reopenedRepo[Symbol.asyncDispose]();
+
+		const { session: again, repo: againRepo } = await openSessionFile(sessionPath);
+		expect((await again.getEntries()).length).toBe(2);
+		await againRepo[Symbol.asyncDispose]();
+	});
+
+	it("capability requires BOTH fsync and truncate: syncFile without truncateFile is not crash-recoverable", async () => {
+		const root = createTempDir();
+		const env = new NodeExecutionEnv({ cwd: root }) as unknown as { truncateFile?: unknown };
+		// Shadow the prototype method with `undefined` (delete does not
+		// remove inherited properties).
+		Object.defineProperty(env, "truncateFile", { value: undefined, writable: true });
+		const repo = new JsonlSessionRepository({ fs: env as unknown as NodeExecutionEnv, sessionsRoot: root });
+		const session = await repo.create({ cwd: root, id: "cap-sync-only" });
+		expect(session.supportsCrashRecoverableReceipts()).toBe(false);
+		// The journal seam fails closed and the Session falls back to a
+		// publish-only plain append.
+		const message = createUserMessage("no truncate capability");
+		const contentHash = await computeMessageContentHash(message);
+		const { entryId } = await session.appendMessageWithCommitReceipt(message, (id) => receiptFor(id, contentHash));
+		expect((await session.getEntry(entryId))?.type).toBe("message");
+		expect(await session.readPendingCommitReceipts()).toEqual([]);
+		await repo[Symbol.asyncDispose]();
+	});
+
 	it("recovery stays idempotent across restarts: acked pairs never re-emit", async () => {
 		const root = createTempDir();
 		const fs = new NodeExecutionEnv({ cwd: root });
