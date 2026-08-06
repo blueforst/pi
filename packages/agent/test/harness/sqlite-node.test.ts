@@ -296,6 +296,84 @@ describe("SQLite crash-consistent commit journal (iris_agent#40 Feature 2)", () 
 		expect(finalized.length).toBe(1);
 	});
 
+	it("iris_agent#50: quarantines receipts whose entry is missing or not a message, and messages with unknown roles", async () => {
+		const root = createTempDir();
+		const env = new NodeExecutionEnv({ cwd: root });
+		const databasePath = join(root, "sessions.sqlite");
+		const sqlite = createNodeSqliteFactory();
+
+		// Process 1: three committed messages (real hashes), then tamper the
+		// PERSISTED entries directly: delete the middle entry row and flip the
+		// third entry's payload role to an unknown role (leaving its receipt
+		// untouched).
+		const repo = new SqliteSessionRepository({ env, sqlite, databasePath });
+		const session = await repo.create({ cwd: root, id: "session-branches" });
+		const metadata = await session.getMetadata();
+		const messages = [createUserMessage("one"), createUserMessage("two"), createUserMessage("three")];
+		const hashes = await Promise.all(messages.map((message) => computeMessageContentHash(message)));
+		const entryIds: string[] = [];
+		for (let i = 0; i < messages.length; i++) {
+			const { entryId } = await session.appendMessageWithCommitReceipt(messages[i]!, (id) => ({
+				sessionId: metadata.id,
+				entryId: id,
+				contentHash: hashes[i]!,
+				committedAt: new Date().toISOString(),
+			}));
+			entryIds.push(entryId);
+		}
+		await repo[Symbol.asyncDispose]();
+
+		const tamperDb = await sqlite.open(databasePath);
+		await tamperDb
+			.prepare("DELETE FROM session_entries WHERE session_id = ? AND id = ?")
+			.run(metadata.id, entryIds[1]);
+		// Flip the third entry's message role to an unknown role, preserving
+		// the stored payload shape (the entry wrapper with .message).
+		const thirdRow = (await tamperDb
+			.prepare("SELECT payload FROM session_entries WHERE session_id = ? AND id = ?")
+			.get(metadata.id, entryIds[2])) as { payload: string };
+		const thirdEntry = JSON.parse(thirdRow.payload) as {
+			message: { role: string; content: unknown; timestamp: number };
+		};
+		await tamperDb
+			.prepare("UPDATE session_entries SET payload = ? WHERE session_id = ? AND id = ?")
+			.run(
+				JSON.stringify({ ...thirdEntry, message: { ...thirdEntry.message, role: "evil" } }),
+				metadata.id,
+				entryIds[2],
+			);
+		await tamperDb.close();
+
+		// Process 2: recovery must quarantine entry 2 (missing_message_entry)
+		// and entry 3 (invalid_role), and still emit entry 1 exactly once.
+		const reopenedRepo = new SqliteSessionRepository({ env, sqlite, databasePath });
+		ownedRepositories.push(reopenedRepo);
+		const reopened = await reopenedRepo.open(metadata);
+		const finalized: MessageFinalizedEvent[] = [];
+		const harness = new AgentHarness({
+			models,
+			session: reopened as unknown as Session,
+			model: newFaux().getModel(),
+			systemPrompt: "You are helpful.",
+		});
+		harness.subscribe((event) => {
+			if (event.type === "message_finalized") finalized.push(event as MessageFinalizedEvent);
+		});
+
+		expect(await harness.recoverPendingCommitReceipts()).toBe(1);
+		expect(finalized.map((event) => event.entryId)).toEqual([entryIds[0]]);
+
+		const quarantined = await reopened.readQuarantinedCommitReceipts();
+		const byId = new Map(quarantined.map((q) => [q.entryId, q.reason]));
+		expect(byId.get(entryIds[1])).toContain("missing_message_entry");
+		expect(byId.get(entryIds[2])).toContain("invalid_role");
+
+		// Idempotent across retry: nothing new emits, nothing re-quarantines.
+		expect(await harness.recoverPendingCommitReceipts()).toBe(0);
+		expect(finalized.length).toBe(1);
+		expect((await reopened.readQuarantinedCommitReceipts()).length).toBe(2);
+	});
+
 	it("iris_agent#50: receipts sharing one committed_at replay in exact append order (authoritative receipt_seq)", async () => {
 		const root = createTempDir();
 		const env = new NodeExecutionEnv({ cwd: root });
