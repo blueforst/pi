@@ -3,6 +3,7 @@
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "fs";
 import { dirname, join, resolve } from "path";
 import { fileURLToPath } from "url";
+import { fetch as undiciFetch, ProxyAgent } from "undici";
 import { getEffortThinkingLevelMap, type ModelsDevReasoningOption } from "./models-dev-reasoning-options.ts";
 import {
 	CLOUDFLARE_AI_GATEWAY_ANTHROPIC_BASE_URL,
@@ -21,6 +22,8 @@ import type {
 } from "../src/types.ts";
 import {
 	createModelDataManifest,
+	type ModelDataManifest,
+	type ModelDataSource,
 	type ModelDataStructure,
 	MODEL_DATA_MANIFEST_FILE,
 	readModelDataProviderIds,
@@ -30,7 +33,6 @@ import {
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
-const packageRoot = join(__dirname, "..");
 
 function readGeneratorOptions(args: string[]): {
 	strict: boolean;
@@ -38,12 +40,18 @@ function readGeneratorOptions(args: string[]): {
 	jsonOnly: boolean;
 	jsonOutputDir: string | undefined;
 	pretty: boolean;
+	fromData: boolean;
+	checkOnly: boolean;
+	packageRoot: string | undefined;
 } {
 	let strict = false;
 	let dataOnly = false;
 	let jsonOnly = false;
 	let jsonOutputDir: string | undefined;
 	let pretty = false;
+	let fromData = false;
+	let checkOnly = false;
+	let packageRoot: string | undefined;
 
 	for (let index = 0; index < args.length; index++) {
 		const arg = args[index];
@@ -63,6 +71,20 @@ function readGeneratorOptions(args: string[]): {
 			pretty = true;
 			continue;
 		}
+		if (arg === "--from-data") {
+			fromData = true;
+			continue;
+		}
+		if (arg === "--check-only") {
+			checkOnly = true;
+			continue;
+		}
+		if (arg === "--package-root") {
+			const value = args[++index];
+			if (!value) throw new Error("--package-root requires a directory");
+			packageRoot = resolve(value);
+			continue;
+		}
 		if (arg === "--json-output") {
 			const value = args[++index];
 			if (!value) throw new Error("--json-output requires a directory");
@@ -74,10 +96,13 @@ function readGeneratorOptions(args: string[]): {
 
 	if (jsonOnly && !jsonOutputDir) throw new Error("--json-only requires --json-output");
 	if (dataOnly && (jsonOnly || jsonOutputDir)) throw new Error("--data-only cannot be combined with JSON catalog output");
-	return { strict, dataOnly, jsonOnly, jsonOutputDir, pretty };
+	if (fromData && dataOnly) throw new Error("--from-data cannot be combined with --data-only");
+	if (checkOnly && !fromData) throw new Error("--check-only requires --from-data");
+	return { strict, dataOnly, jsonOnly, jsonOutputDir, pretty, fromData, checkOnly, packageRoot };
 }
 
 const generatorOptions = readGeneratorOptions(process.argv.slice(2));
+const packageRoot = generatorOptions.packageRoot ?? join(__dirname, "..");
 
 interface ModelsDevModel {
 	id: string;
@@ -206,6 +231,34 @@ const AI_GATEWAY_MODELS_URL = "https://ai-gateway.vercel.sh/v1";
 const AI_GATEWAY_BASE_URL = "https://ai-gateway.vercel.sh";
 const VERTEX_BASE_URL = "https://{location}-aiplatform.googleapis.com";
 const NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1";
+
+// Upstream catalog endpoints. Each can be overridden through the environment
+// (e.g. PI_MODELS_DEV_URL=http://127.0.0.1:1/api.json) so failure handling and
+// offline behaviour are testable without mutating the real upstream services.
+const MODELS_DEV_API_URL = process.env.PI_MODELS_DEV_URL ?? "https://models.dev/api.json";
+const NVIDIA_MODELS_URL = process.env.PI_NVIDIA_MODELS_URL ?? `${NVIDIA_BASE_URL}/models`;
+const OPENROUTER_MODELS_URL = process.env.PI_OPENROUTER_MODELS_URL ?? "https://openrouter.ai/api/v1/models";
+const AI_GATEWAY_ENDPOINT = process.env.PI_AI_GATEWAY_URL ?? `${AI_GATEWAY_MODELS_URL}/models`;
+
+// The explicit refresh path may run behind an HTTP(S) proxy (e.g. a local
+// development box); the normal hermetic build never calls this. undici's own
+// fetch + ProxyAgent are used together so dispatcher and client versions
+// cannot mismatch (Node's built-in fetch would reject an 8.x ProxyAgent).
+const proxyUrl = process.env.HTTPS_PROXY ?? process.env.https_proxy ?? process.env.HTTP_PROXY ?? process.env.http_proxy;
+const upstreamFetch = (
+	input: Parameters<typeof undiciFetch>[0],
+	init?: Parameters<typeof undiciFetch>[1],
+): Promise<Awaited<ReturnType<typeof undiciFetch>>> =>
+	proxyUrl ? undiciFetch(input, { ...init, dispatcher: new ProxyAgent(proxyUrl) }) : undiciFetch(input, init);
+
+// Provenance of the generated snapshot: one entry per upstream source that was
+// queried during this run. Recorded into the model data manifest so refreshes
+// are auditable (source URL + fetch time + outcome).
+const modelDataSources: ModelDataSource[] = [];
+
+function recordModelDataSource(name: string, url: string, outcome: string): void {
+	modelDataSources.push({ name, url, fetchedAt: new Date().toISOString(), status: outcome });
+}
 const NVIDIA_HEADERS = {
 	"NVCF-POLL-SECONDS": "3600",
 } as const;
@@ -950,7 +1003,7 @@ function getModelsDevCost(cost: ModelsDevModel["cost"]): ModelCost {
 async function fetchNvidiaNimModelIds(): Promise<Map<string, string>> {
 	try {
 		console.log("Fetching models from NVIDIA NIM API...");
-		const response = await fetch(`${NVIDIA_BASE_URL}/models`);
+		const response = await upstreamFetch(NVIDIA_MODELS_URL);
 		if (!response.ok) throw new Error(`NVIDIA NIM API returned ${response.status}`);
 		const data = (await response.json()) as { data?: NvidiaNimModelListItem[] };
 		const modelIds = new Map<string, string>();
@@ -961,9 +1014,11 @@ async function fetchNvidiaNimModelIds(): Promise<Map<string, string>> {
 		}
 
 		console.log(`Fetched ${data.data?.length ?? 0} model IDs from NVIDIA NIM`);
+		recordModelDataSource("nvidia", NVIDIA_MODELS_URL, "ok");
 		return modelIds;
 	} catch (error) {
 		console.error("Failed to fetch NVIDIA NIM models:", error);
+		recordModelDataSource("nvidia", NVIDIA_MODELS_URL, `error: ${error instanceof Error ? error.message : String(error)}`);
 		if (generatorOptions.strict) throw error;
 		return new Map();
 	}
@@ -972,10 +1027,9 @@ async function fetchNvidiaNimModelIds(): Promise<Map<string, string>> {
 async function fetchOpenRouterModels(): Promise<Model<any>[]> {
 	try {
 		console.log("Fetching models from OpenRouter API...");
-		const response = await fetch("https://openrouter.ai/api/v1/models");
+		const response = await upstreamFetch(OPENROUTER_MODELS_URL);
 		if (!response.ok) throw new Error(`OpenRouter API returned ${response.status}`);
-		const data = await response.json();
-
+		const data = (await response.json()) as { data: OpenRouterModel[] };
 		const models: Model<any>[] = [];
 
 		for (const model of data.data) {
@@ -1023,9 +1077,11 @@ async function fetchOpenRouterModels(): Promise<Model<any>[]> {
 		}
 
 		console.log(`Fetched ${models.length} tool-capable models from OpenRouter`);
+		recordModelDataSource("openrouter", OPENROUTER_MODELS_URL, "ok");
 		return models;
 	} catch (error) {
 		console.error("Failed to fetch OpenRouter models:", error);
+		recordModelDataSource("openrouter", OPENROUTER_MODELS_URL, `error: ${error instanceof Error ? error.message : String(error)}`);
 		if (generatorOptions.strict) throw error;
 		return [];
 	}
@@ -1034,9 +1090,9 @@ async function fetchOpenRouterModels(): Promise<Model<any>[]> {
 async function fetchAiGatewayModels(): Promise<Model<any>[]> {
 	try {
 		console.log("Fetching models from Vercel AI Gateway API...");
-		const response = await fetch(`${AI_GATEWAY_MODELS_URL}/models`);
+		const response = await upstreamFetch(AI_GATEWAY_ENDPOINT);
 		if (!response.ok) throw new Error(`Vercel AI Gateway API returned ${response.status}`);
-		const data = await response.json();
+		const data = (await response.json()) as { data: AiGatewayModel[] };
 		const models: Model<any>[] = [];
 
 		const toNumber = (value: string | number | undefined): number => {
@@ -1083,9 +1139,11 @@ async function fetchAiGatewayModels(): Promise<Model<any>[]> {
 		}
 
 		console.log(`Fetched ${models.length} tool-capable models from Vercel AI Gateway`);
+		recordModelDataSource("vercel-ai-gateway", AI_GATEWAY_ENDPOINT, "ok");
 		return models;
 	} catch (error) {
 		console.error("Failed to fetch Vercel AI Gateway models:", error);
+		recordModelDataSource("vercel-ai-gateway", AI_GATEWAY_ENDPOINT, `error: ${error instanceof Error ? error.message : String(error)}`);
 		if (generatorOptions.strict) throw error;
 		return [];
 	}
@@ -1188,7 +1246,7 @@ function processBasetenModels(provider: ModelsDevProvider | undefined): Model<Ap
 async function loadModelsDevData(): Promise<Model<any>[]> {
 	try {
 		console.log("Fetching models from models.dev API...");
-		const response = await fetch("https://models.dev/api.json");
+		const response = await upstreamFetch(MODELS_DEV_API_URL);
 		if (!response.ok) throw new Error(`models.dev API returned ${response.status}`);
 		const data = (await response.json()) as ModelsDevCatalog;
 
@@ -2164,15 +2222,113 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 		}
 
 		console.log(`Loaded ${models.length} tool-capable models from models.dev`);
+		recordModelDataSource("models.dev", MODELS_DEV_API_URL, "ok");
 		return models;
 	} catch (error) {
 		console.error("Failed to load models.dev data:", error);
+		recordModelDataSource("models.dev", MODELS_DEV_API_URL, `error: ${error instanceof Error ? error.message : String(error)}`);
 		if (generatorOptions.strict) throw error;
 		return [];
 	}
 }
 
+const GENERATED_HEADER = `// This file is auto-generated by scripts/generate-models.ts
+// Do not edit manually - run 'npm run generate-models' to update
+
+`;
+
+function catalogConstName(providerId: string): string {
+	return `${providerId.toUpperCase().replace(/[^A-Z0-9]+/g, "_")}_MODELS`;
+}
+
+function renderCatalogShard(providerId: string): string {
+	let output = GENERATED_HEADER;
+	output += `import values from "./data/${providerId}.json" with { type: "json" };\n`;
+	output += `import { flattenModelCatalog, type ModelCatalog } from "../model-catalog.ts";\n\n`;
+	output += `export const ${catalogConstName(providerId)}: ModelCatalog<typeof values, ${JSON.stringify(providerId)}> =\n`;
+	output += `	flattenModelCatalog(${JSON.stringify(providerId)}, values);\n`;
+	return output;
+}
+
+function renderAggregator(providerIds: readonly string[]): string {
+	let output = GENERATED_HEADER;
+	for (const providerId of providerIds) {
+		output += `import { ${catalogConstName(providerId)} } from "./providers/${providerId}.models.ts";\n`;
+	}
+	output += `\nexport const MODELS: {\n`;
+	for (const providerId of providerIds) {
+		output += `	readonly ${JSON.stringify(providerId)}: typeof ${catalogConstName(providerId)};\n`;
+	}
+	output += `} = {\n`;
+	for (const providerId of providerIds) {
+		output += `	${JSON.stringify(providerId)}: ${catalogConstName(providerId)},\n`;
+	}
+	output += `};\n`;
+	return output;
+}
+
+// Reads the committed provider data directory (the content-addressed snapshot)
+// and regenerates the TypeScript shards and aggregator from it. This is the
+// hermetic build path: it never touches the network. `--check-only` compares
+// the rendered output against the files already on disk instead of writing.
+function generateCatalogFromCommittedData(): void {
+	const providersDir = join(packageRoot, "src/providers");
+	const dataDir = join(providersDir, "data");
+	const aggregatorPath = join(packageRoot, "src/models.generated.ts");
+
+	// Validate the committed snapshot itself: manifest schema, structure hash
+	// and per-file checksums must all match before we trust the data.
+	validateGeneratedModelData(packageRoot);
+
+	const providerIds = readdirSync(dataDir)
+		.filter((entry) => entry.endsWith(".json") && entry !== MODEL_DATA_MANIFEST_FILE)
+		.map((entry) => entry.slice(0, -".json".length))
+		.sort();
+
+	const shardFiles = new Map(providerIds.map((providerId) => [providerId, renderCatalogShard(providerId)] as const));
+	const aggregator = renderAggregator(providerIds);
+
+	if (generatorOptions.checkOnly) {
+		const mismatches: string[] = [];
+		for (const providerId of providerIds) {
+			const path = join(providersDir, `${providerId}.models.ts`);
+			const existing = existsSync(path) ? readFileSync(path, "utf8") : undefined;
+			const expected = shardFiles.get(providerId);
+			if (existing !== expected) mismatches.push(`${providerId}.models.ts`);
+		}
+		for (const entry of readdirSync(providersDir)) {
+			if (!entry.endsWith(".models.ts")) continue;
+			if (!shardFiles.has(entry.slice(0, -".models.ts".length))) mismatches.push(`stale ${entry}`);
+		}
+		const existingAggregator = existsSync(aggregatorPath) ? readFileSync(aggregatorPath, "utf8") : undefined;
+		if (existingAggregator !== aggregator) mismatches.push("models.generated.ts");
+		if (mismatches.length > 0) {
+			console.error(`Generated TypeScript catalog is out of sync with committed model data:\n  - ${mismatches.join("\n  - ")}`);
+			console.error("Run `npm run generate:models` to refresh from upstream catalogs, or `npm run generate-models:from-data` to regenerate from the committed snapshot.");
+			process.exitCode = 1;
+			return;
+		}
+		console.log("Generated TypeScript catalog matches the committed model data snapshot.");
+		return;
+	}
+
+	for (const [providerId, content] of shardFiles) {
+		writeFileSync(join(providersDir, `${providerId}.models.ts`), content);
+	}
+	for (const entry of readdirSync(providersDir)) {
+		if (!entry.endsWith(".models.ts")) continue;
+		if (!shardFiles.has(entry.slice(0, -".models.ts".length))) rmSync(join(providersDir, entry));
+	}
+	writeFileSync(aggregatorPath, aggregator);
+	console.log("Generated provider catalogs and src/models.generated.ts from committed model data");
+}
+
 async function generateModels() {
+	if (generatorOptions.fromData) {
+		generateCatalogFromCommittedData();
+		return;
+	}
+
 	// Fetch models from both sources
 	// models.dev: Anthropic, Google, OpenAI, Groq, Cerebras
 	// OpenRouter: xAI and other providers (excluding Anthropic, Google, OpenAI)
@@ -2745,7 +2901,7 @@ async function generateModels() {
 			}
 			writeJson(
 				join(stagedDataDir, MODEL_DATA_MANIFEST_FILE),
-				createModelDataManifest(modelDataStructure, fileContents, generatedAt),
+				createModelDataManifest(modelDataStructure, fileContents, generatedAt, modelDataSources),
 			);
 			validateModelDataDirectory(modelDataStructure, stagedDataDir);
 
@@ -2767,41 +2923,17 @@ async function generateModels() {
 					writeFileSync(aggregatorPath, previousAggregator);
 				};
 
-				const generatedHeader = `// This file is auto-generated by scripts/generate-models.ts
-// Do not edit manually - run 'npm run generate-models' to update
-
-`;
-				const catalogConstName = (providerId: string) =>
-					`${providerId.toUpperCase().replace(/[^A-Z0-9]+/g, "_")}_MODELS`;
 				const generatedShardFiles = new Set<string>();
 				for (const providerId of sortedProviderIds) {
-					let output = generatedHeader;
-					output += `import values from "./data/${providerId}.json" with { type: "json" };\n`;
-					output += `import { flattenModelCatalog, type ModelCatalog } from "../model-catalog.ts";\n\n`;
-					output += `export const ${catalogConstName(providerId)}: ModelCatalog<typeof values, ${JSON.stringify(providerId)}> =\n`;
-					output += `\tflattenModelCatalog(${JSON.stringify(providerId)}, values);\n`;
 					const filename = `${providerId}.models.ts`;
 					generatedShardFiles.add(filename);
-					writeFileSync(join(providersDir, filename), output);
+					writeFileSync(join(providersDir, filename), renderCatalogShard(providerId));
 				}
 				for (const entry of readdirSync(providersDir)) {
 					if (entry.endsWith(".models.ts") && !generatedShardFiles.has(entry)) rmSync(join(providersDir, entry));
 				}
 
-				let output = generatedHeader;
-				for (const providerId of sortedProviderIds) {
-					output += `import { ${catalogConstName(providerId)} } from "./providers/${providerId}.models.ts";\n`;
-				}
-				output += `\nexport const MODELS: {\n`;
-				for (const providerId of sortedProviderIds) {
-					output += `\treadonly ${JSON.stringify(providerId)}: typeof ${catalogConstName(providerId)};\n`;
-				}
-				output += `} = {\n`;
-				for (const providerId of sortedProviderIds) {
-					output += `\t${JSON.stringify(providerId)}: ${catalogConstName(providerId)},\n`;
-				}
-				output += `};\n`;
-				writeFileSync(aggregatorPath, output);
+				writeFileSync(aggregatorPath, renderAggregator(sortedProviderIds));
 				console.log("Generated provider catalogs and src/models.generated.ts");
 			}
 

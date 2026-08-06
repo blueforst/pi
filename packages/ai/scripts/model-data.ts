@@ -7,11 +7,23 @@ export const MODEL_DATA_MANIFEST_FILE = ".manifest.json";
 
 export type ModelDataStructure = Record<string, Record<string, string>>;
 
+export interface ModelDataSource {
+	/** Short upstream name, e.g. "models.dev" or "openrouter". */
+	name: string;
+	/** Endpoint URL that was fetched for this source. */
+	url: string;
+	/** ISO timestamp of the successful fetch. */
+	fetchedAt: string;
+	/** HTTP status or error class of the fetch attempt. */
+	status: string;
+}
+
 export interface ModelDataManifest {
 	schemaVersion: number;
 	generatedAt: string;
 	structureHash: string;
 	files: Record<string, string>;
+	sources: ModelDataSource[];
 }
 
 const MODEL_DATA_IMPORT_PATTERN =
@@ -121,12 +133,14 @@ export function createModelDataManifest(
 	structure: ModelDataStructure,
 	fileContents: Readonly<Record<string, string>>,
 	generatedAt: string,
+	sources: ModelDataSource[],
 ): ModelDataManifest {
 	return {
 		schemaVersion: MODEL_DATA_SCHEMA_VERSION,
 		generatedAt,
 		structureHash: modelDataStructureHash(structure),
 		files: sortedRecord(Object.entries(fileContents).map(([file, content]) => [file, sha256(content)] as const)),
+		sources,
 	};
 }
 
@@ -208,6 +222,23 @@ export function validateModelDataDirectory(structure: ModelDataStructure, dataDi
 	}
 	if (typeof manifest?.generatedAt !== "string" || Number.isNaN(Date.parse(manifest.generatedAt))) {
 		errors.push("model data manifest has an invalid generation timestamp");
+	}
+	if (!Array.isArray(manifest?.sources) || manifest.sources.length === 0) {
+		errors.push("model data manifest has no source metadata");
+	} else {
+		for (const source of manifest.sources) {
+			if (
+				!isRecord(source) ||
+				typeof source.name !== "string" ||
+				typeof source.url !== "string" ||
+				typeof source.fetchedAt !== "string" ||
+				Number.isNaN(Date.parse(source.fetchedAt)) ||
+				typeof source.status !== "string"
+			) {
+				errors.push("model data manifest has malformed source metadata");
+				break;
+			}
+		}
 	}
 	const expectedStructureHash = modelDataStructureHash(structure);
 	if (manifest?.structureHash !== expectedStructureHash) {
