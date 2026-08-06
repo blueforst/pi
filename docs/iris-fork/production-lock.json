@@ -7,11 +7,11 @@
 	},
 	"acceptedRuntime": {
 		"repository": "blueforst/pi",
-		"commit": "d22db09dcdfac494858c8ff43e478645a3a6fc41",
-		"tree": "8b7e4081771843575c99ec54d7d50a1cc94085d7",
+		"commit": "9a4ece9bf2f7bc01f66f45b81726ddc41b2859ef",
+		"tree": "db5c17fb08c5e4d0e91662ff1a0a3abc67239325",
 		"verifiedAt": "2026-08-07",
 		"equivalentCommit": "47f85a370a30a34a1e1c4533902f33818651d1b0",
-		"notes": "53553aeb039d81df6eed606770b398e6d5fbfb4e is the accepted fork head containing the iris_agent#51 framed JSONL entry+receipt journal (PI-019) PLUS the missing-newline torn-tail append guard (review finding: appends emit a missing newline first so a complete frame written before a torn tail is never concatenated into a quarantined line). Prior accepted identity 18d059bf is an ancestor. acceptedRuntime is the single authoritative identity for the Pi runtime iris_agent is allowed to consume; floating main is never an accepted identity."
+		"notes": "9a4ece9bf is the accepted fork head containing the iris_agent#51 framed JSONL entry+receipt journal (PI-019: versioned frame with monotonic seq + sha256 checksum, fsync durability boundary via FileSystem.syncFile, explicit supportsCrashRecoverableReceipts capability, torn-tail quarantine with typed diagnostics) PLUS both review-finding fixes: (1) the missing-newline torn-tail append guard (appends emit a missing newline first so a complete frame written before a torn tail is never concatenated into a quarantined line) and (2) the physical torn-tail repair (FileSystem.truncateFile truncates quarantined torn bytes on load so they can never become mid-file corruption after later appends). Prior accepted identity 18d059bf is an ancestor. acceptedRuntime is the single authoritative identity for the Pi runtime iris_agent is allowed to consume; floating main is never an accepted identity."
 	},
 	"upstream": {
 		"repository": "earendil-works/pi",
