@@ -601,6 +601,27 @@ export class NodeExecutionEnv implements ExecutionEnv {
 		}
 	}
 
+	/**
+	 * Explicit torn-tail repair boundary (iris_agent#51): truncate the file
+	 * in place to `length` bytes and flush, so a quarantined torn-tail line
+	 * is physically removed (never re-poisoning later reopens after appends).
+	 */
+	async truncateFile(path: string, length: number): Promise<Result<void, FileError>> {
+		const resolved = resolvePath(this.cwd, path);
+		try {
+			const handle = await open(resolved, "r+");
+			try {
+				await handle.truncate(length);
+				await handle.sync();
+			} finally {
+				await handle.close();
+			}
+			return ok(undefined);
+		} catch (error) {
+			return err(toFileError(error, resolved));
+		}
+	}
+
 	async fileInfo(path: string): Promise<Result<FileInfo, FileError>> {
 		const resolved = resolvePath(this.cwd, path);
 		try {

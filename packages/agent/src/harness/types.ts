@@ -316,6 +316,15 @@ export interface FileSystem {
 	 * a backend without this method cannot claim crash-recoverable receipts.
 	 */
 	syncFile?(path: string, abortSignal?: AbortSignal): Promise<Result<void, FileError>>;
+	/**
+	 * Optional in-place truncate capability (iris_agent#51). When present,
+	 * implementations must truncate the file to exactly `length` bytes and
+	 * flush the change. Used by the JSONL commit journal to physically remove
+	 * a quarantined torn-tail line so it can never re-poison a later reopen
+	 * after appends (a torn line is only legal at EOF; once it becomes a
+	 * middle line the whole Session would fail closed).
+	 */
+	truncateFile?(path: string, length: number, abortSignal?: AbortSignal): Promise<Result<void, FileError>>;
 	/** Return metadata for the addressed path without following symlinks. */
 	fileInfo(path: string, abortSignal?: AbortSignal): Promise<Result<FileInfo, FileError>>;
 	/** List direct children of a directory without following symlinks. */

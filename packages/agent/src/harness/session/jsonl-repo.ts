@@ -40,11 +40,16 @@ export type JsonlSessionRepositoryFileSystem = Pick<
 	| "exists"
 	| "createDir"
 	| "remove"
-> & { syncFile?: FileSystem["syncFile"] };
+	| "syncFile"
+	| "truncateFile"
+>;
 
 type JsonlSessionFileSystem = Pick<FileSystem, "readTextFile" | "readTextLines" | "writeFile" | "appendFile">;
 
 const DEFAULT_MAX_CONCURRENT_OPERATIONS = 4;
+
+/** Bound on retained per-path load diagnostics (torn-tail quarantine notes). */
+const MAX_LOAD_DIAGNOSTICS = 16;
 
 interface SessionHeader {
 	type: "session";
@@ -171,6 +176,7 @@ async function loadJsonlSession(fs: JsonlSessionFileSystem, path: string): Promi
 	const pendingReceipts: { receipt: SessionCommitReceipt; order: number }[] = [];
 	const diagnostics: string[] = [];
 	let maxJournalSeq = 0;
+	let tornTailCleanLength: number | undefined;
 	const entryIds = new Set<string>();
 
 	for (let i = 1; i < lines.length; i++) {
@@ -186,6 +192,12 @@ async function loadJsonlSession(fs: JsonlSessionFileSystem, path: string): Promi
 		const quarantineTail = (message: string): boolean => {
 			if (!isTail) return false;
 			diagnostics.push(`torn_tail: line ${lineNumber}: ${message}; quarantined`);
+			// Byte offset of the LAST COMPLETE line: the torn line is the
+			// suffix of the file (possibly followed by its own trailing
+			// newline). The backend truncates to this offset so the torn
+			// bytes can never become a mid-file corruption after later
+			// appends (review finding, iris_agent#51).
+			tornTailCleanLength = content.length - line.length - (content.endsWith("\n") ? 1 : 0);
 			return true;
 		};
 
@@ -255,6 +267,7 @@ async function loadJsonlSession(fs: JsonlSessionFileSystem, path: string): Promi
 		diagnostics,
 		maxJournalSeq,
 		tailEndsWithNewline: content.endsWith("\n"),
+		tornTailCleanLength,
 	};
 }
 
@@ -402,6 +415,13 @@ interface JsonlSessionLoadResult {
 	maxJournalSeq: number;
 	/** Whether the file tail ends with a newline (torn-tail append guard). */
 	tailEndsWithNewline: boolean;
+	/**
+	 * When a torn tail was quarantined this load: byte offset of the last
+	 * COMPLETE line. The backend physically truncates the file to this
+	 * offset (when the fs has truncateFile) so the torn bytes cannot
+	 * re-poison later reopens after appends.
+	 */
+	tornTailCleanLength?: number;
 }
 
 function encodeCwd(cwd: string): string {
@@ -473,17 +493,49 @@ export class JsonlSessionBackend {
 		);
 	}
 
+	/**
+	 * Load the session file and, when a torn tail was quarantined AND the
+	 * filesystem can truncate, physically remove the torn bytes so they can
+	 * never become a mid-file corruption after later appends (iris_agent#51
+	 * review finding). The repair is idempotent: once truncated, subsequent
+	 * loads find a clean tail and do nothing.
+	 */
+	/**
+	 * Torn-tail / corruption diagnostics are sticky per path: the load that
+	 * quarantined a torn tail must keep its note visible to health/readiness
+	 * consumers even though later (post-repair) loads are clean. Merged
+	 * append-only with a bounded cap so repeated corruption events cannot
+	 * grow the list without bound.
+	 */
+	private recordDiagnostics(path: string, diagnostics: readonly string[]): void {
+		if (diagnostics.length === 0) return;
+		const existing = this.loadDiagnosticsByPath.get(path) ?? [];
+		this.loadDiagnosticsByPath.set(path, [...existing, ...diagnostics].slice(-MAX_LOAD_DIAGNOSTICS));
+	}
+
+	private async loadAndRepair(metadata: JsonlSessionMetadata): Promise<JsonlSessionLoadResult> {
+		const document = await loadJsonlSession(this.fs, metadata.path);
+		if (document.tornTailCleanLength !== undefined && this.fs.truncateFile !== undefined) {
+			getFileSystemResultOrThrow(
+				await this.fs.truncateFile(metadata.path, document.tornTailCleanLength),
+				`Failed to repair torn tail of ${metadata.path}`,
+			);
+			this.newlineTailsByPath.set(metadata.path, true);
+		}
+		return document;
+	}
+
 	private async loadDocument(metadata: JsonlSessionMetadata): Promise<JsonlSessionMetadata> {
 		if (
 			!getFileSystemResultOrThrow(await this.fs.exists(metadata.path), `Failed to check session ${metadata.path}`)
 		) {
 			throw new SessionError("not_found", `Session not found: ${metadata.path}`);
 		}
-		const document = await loadJsonlSession(this.fs, metadata.path);
+		const document = await this.loadAndRepair(metadata);
 		const entries = this.entryIndexesByPath.get(metadata.path);
 		if (entries) entries.replace(document.entries);
 		else this.entryIndexesByPath.set(metadata.path, new ArraySessionIndex(document.entries));
-		this.loadDiagnosticsByPath.set(metadata.path, document.diagnostics);
+		this.recordDiagnostics(metadata.path, document.diagnostics);
 		this.journalSeqsByPath.set(metadata.path, document.maxJournalSeq);
 		this.newlineTailsByPath.set(metadata.path, document.tailEndsWithNewline);
 		return document.metadata;
@@ -692,10 +744,10 @@ export class JsonlSessionBackend {
 			) {
 				throw new SessionError("not_found", `Session not found: ${metadata.path}`);
 			}
-			if (this.fs.syncFile === undefined) {
+			if (this.fs.syncFile === undefined || this.fs.truncateFile === undefined) {
 				throw new SessionError(
 					"storage",
-					`JSONL commit journal requires fsync (syncFile) capability; crash-recoverable receipts are unsupported on this filesystem (${metadata.path})`,
+					`JSONL commit journal requires fsync (syncFile) and torn-tail repair (truncateFile) capabilities; crash-recoverable receipts are unsupported on this filesystem (${metadata.path})`,
 				);
 			}
 			let entries = this.entryIndexesByPath.get(metadata.path);
@@ -731,8 +783,8 @@ export class JsonlSessionBackend {
 	private async readPendingCommitReceipts(metadata: JsonlSessionMetadata): Promise<readonly SessionCommitReceipt[]> {
 		this.assertOpen();
 		return this.operations.enqueue(this.operationKey(metadata), async () => {
-			const document = await loadJsonlSession(this.fs, metadata.path);
-			this.loadDiagnosticsByPath.set(metadata.path, document.diagnostics);
+			const document = await this.loadAndRepair(metadata);
+			this.recordDiagnostics(metadata.path, document.diagnostics);
 			this.journalSeqsByPath.set(metadata.path, document.maxJournalSeq);
 			this.newlineTailsByPath.set(metadata.path, document.tailEndsWithNewline);
 			return [...document.pendingReceipts].sort((a, b) => a.order - b.order).map((pending) => pending.receipt);
@@ -764,10 +816,12 @@ export class JsonlSessionBackend {
 
 	/**
 	 * iris_agent#51 explicit durability capability: crash-recoverable receipts
-	 * are supported exactly when the filesystem can fsync.
+	 * are supported exactly when the filesystem can fsync (durable append
+	 * boundary) AND truncate (physical torn-tail repair; without it a torn
+	 * line would poison every reopen after later appends).
 	 */
 	supportsCrashRecoverableReceipts(): boolean {
-		return this.fs.syncFile !== undefined;
+		return this.fs.syncFile !== undefined && this.fs.truncateFile !== undefined;
 	}
 
 	/** Diagnostics from the most recent load of this session file. */

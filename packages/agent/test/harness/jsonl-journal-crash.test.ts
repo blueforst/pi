@@ -285,6 +285,80 @@ describe("JSONL framed journal crash-safety (iris_agent#51)", () => {
 		}
 	});
 
+	it("partial torn tail is physically repaired on load: append after quarantine keeps every committed pair (review BLOCKING repro)", async () => {
+		const root = createTempDir();
+		const fs = new NodeExecutionEnv({ cwd: root });
+		const repo = new JsonlSessionRepository({ fs, sessionsRoot: root });
+		const session = await repo.create({ cwd: root, id: "torn-repair" });
+		const metadata = await session.getMetadata();
+
+		const first = createUserMessage("first committed pair");
+		const second = createUserMessage("second committed pair");
+		const hash1 = await computeMessageContentHash(first);
+		const hash2 = await computeMessageContentHash(second);
+		await session.appendMessageWithCommitReceipt(first, (id) => receiptFor(id, hash1));
+		await session.appendMessageWithCommitReceipt(second, (id) => receiptFor(id, hash2));
+		const sessionPath = metadata.path;
+		await repo[Symbol.asyncDispose]();
+
+		// Crash mid-write of the second frame: PARTIAL JSON, no trailing
+		// newline (the reviewer's independent repro scenario).
+		const full = readFileSync(sessionPath, "utf8");
+		const lines = full.split("\n");
+		const frame2Start = full.indexOf(lines[2]!);
+		writeFileSync(sessionPath, full.slice(0, frame2Start + Math.floor(lines[2]!.length * 0.5)));
+
+		// Reopen: the torn tail is quarantined with a typed diagnostic, the
+		// first pair is intact, and the torn bytes are physically truncated.
+		{
+			const { session: reopened, repo: reopenedRepo } = await openSessionFile(sessionPath);
+			expect((await reopened.getEntries()).length).toBe(1);
+			const pending = await reopened.readPendingCommitReceipts();
+			expect(pending.length).toBe(1);
+			expect(pending[0]!.contentHash).toBe(hash1);
+			const diagnostics = await reopened.journalDiagnostics();
+			expect(diagnostics.length).toBeGreaterThan(0);
+			expect(diagnostics[0]!).toContain("torn_tail");
+			await reopenedRepo[Symbol.asyncDispose]();
+		}
+
+		// The file on disk no longer contains the torn bytes (repaired).
+		const repaired = readFileSync(sessionPath, "utf8");
+		expect(repaired.endsWith("\n")).toBe(true);
+		expect(repaired.split("\n").filter((l) => l.trim()).length).toBe(2);
+
+		// Append a third frame on the recovered session: this previously
+		// threw on the next reopen because the torn line became a MIDDLE
+		// line (invalid JSON) — the whole session failed closed.
+		{
+			const { session: reopened, repo: reopenedRepo } = await openSessionFile(sessionPath);
+			const third = createUserMessage("third pair after partial torn tail");
+			const hash3 = await computeMessageContentHash(third);
+			await reopened.appendMessageWithCommitReceipt(third, (id) => receiptFor(id, hash3));
+			const entries = await reopened.getEntries();
+			expect(entries.length).toBe(2);
+			const pending = await reopened.readPendingCommitReceipts();
+			expect(pending.length).toBe(2);
+			// The torn frame was never durably committed (unverifiable), so
+			// its seq is not reused and the next commit continues from the
+			// max VALID seq — monotonic, no collision.
+			expect(pending.map((r) => r.entrySeq)).toEqual([1, 2]);
+			await reopenedRepo[Symbol.asyncDispose]();
+		}
+
+		// Reopen again with a fresh instance: the file is healed, both pairs
+		// committed, and the load is clean (the repair note was surfaced by
+		// the instance that performed it; persistence across restarts is the
+		// #50 quarantine ledger's job, not the repaired torn tail's).
+		{
+			const { session: reopened, repo: reopenedRepo } = await openSessionFile(sessionPath);
+			expect((await reopened.getEntries()).length).toBe(2);
+			expect((await reopened.readPendingCommitReceipts()).length).toBe(2);
+			expect(await reopened.journalDiagnostics()).toEqual([]);
+			await reopenedRepo[Symbol.asyncDispose]();
+		}
+	});
+
 	it("recovery stays idempotent across restarts: acked pairs never re-emit", async () => {
 		const root = createTempDir();
 		const fs = new NodeExecutionEnv({ cwd: root });
