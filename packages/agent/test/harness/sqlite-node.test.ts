@@ -1,4 +1,5 @@
 import { join } from "node:path";
+import { createModels, type FauxProviderHandle, fauxProvider } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it } from "vitest";
 import {
 	createNodeSqliteFactory,
@@ -6,11 +7,26 @@ import {
 	type SqliteSessionMetadata,
 	SqliteSessionRepository,
 } from "../../../storage/sqlite-node/src/index.ts";
+import { AgentHarness, computeMessageContentHash } from "../../src/harness/agent-harness.ts";
 import { NodeExecutionEnv } from "../../src/harness/env/nodejs.ts";
 import { JsonlSessionRepository } from "../../src/harness/session/jsonl-repo.ts";
 import { createScanningSessionSearch } from "../../src/harness/session/search.ts";
-import type { SessionSearch, SessionSearchHit, SessionSearchOptions } from "../../src/harness/types.ts";
+import type { Session } from "../../src/harness/session/session.ts";
+import type {
+	MessageFinalizedEvent,
+	SessionSearch,
+	SessionSearchHit,
+	SessionSearchOptions,
+} from "../../src/harness/types.ts";
 import { createTempDir, createUserMessage } from "./session-test-utils.ts";
+
+const models = createModels();
+let fauxCount = 0;
+function newFaux(): FauxProviderHandle {
+	const faux = fauxProvider({ provider: `seam-faux-${++fauxCount}` });
+	models.setProvider(faux.provider);
+	return faux;
+}
 
 const ownedRepositories: AsyncDisposable[] = [];
 
@@ -186,5 +202,97 @@ describe("SqliteSessionRepository with custom search", () => {
 
 		await expect(search.search({ text: "custom query" })).resolves.toEqual([]);
 		expect(searches).toEqual([{ text: "custom query" }]);
+	});
+});
+
+describe("SQLite crash-consistent commit journal (iris_agent#40 Feature 2)", () => {
+	it("persists pending receipts in a transaction and replays them after restart", async () => {
+		const root = createTempDir();
+		const env = new NodeExecutionEnv({ cwd: root });
+		const databasePath = join(root, "sessions.sqlite");
+		const sqlite = createNodeSqliteFactory();
+
+		// First process: create session + record entry + pending receipt, then
+		// "crash" by disposing without publishing (no ack).
+		const repo = new SqliteSessionRepository({ env, sqlite, databasePath });
+		const session = await repo.create({ cwd: root, id: "session-1" });
+		const metadata = await session.getMetadata();
+		const message = createUserMessage("crash window");
+		const contentHash = await computeMessageContentHash(message);
+		await session.appendMessageWithCommitReceipt(message, (entryId) => ({
+			sessionId: metadata.id,
+			entryId,
+			contentHash,
+			committedAt: new Date().toISOString(),
+		}));
+		await repo[Symbol.asyncDispose]();
+
+		// Restart: reopen the same database file.
+		const reopenedRepo = new SqliteSessionRepository({ env, sqlite, databasePath });
+		ownedRepositories.push(reopenedRepo);
+		const reopened = await reopenedRepo.open(metadata);
+		expect((await reopened.readPendingCommitReceipts()).length).toBe(1);
+
+		const finalized: MessageFinalizedEvent[] = [];
+		const harness = new AgentHarness({
+			models,
+			session: reopened as unknown as Session,
+			model: newFaux().getModel(),
+			systemPrompt: "You are helpful.",
+		});
+		harness.subscribe((event) => {
+			if (event.type === "message_finalized") finalized.push(event as MessageFinalizedEvent);
+		});
+
+		expect(await harness.recoverPendingCommitReceipts()).toBe(1);
+		expect(finalized.length).toBe(1);
+		expect(finalized[0]!.receipt.contentHash).toBe(contentHash);
+		expect(await reopened.readPendingCommitReceipts()).toEqual([]);
+
+		// Third restart must not re-emit (acked row persisted).
+		const thirdRepo = new SqliteSessionRepository({ env, sqlite, databasePath });
+		ownedRepositories.push(thirdRepo);
+		const third = await thirdRepo.open(metadata);
+		const harness2 = new AgentHarness({
+			models,
+			session: third as unknown as Session,
+			model: newFaux().getModel(),
+			systemPrompt: "You are helpful.",
+		});
+		const secondRun: MessageFinalizedEvent[] = [];
+		harness2.subscribe((event) => {
+			if (event.type === "message_finalized") secondRun.push(event as MessageFinalizedEvent);
+		});
+		expect(await harness2.recoverPendingCommitReceipts()).toBe(0);
+		expect(secondRun.length).toBe(0);
+	});
+
+	it("acknowledges receipts after normal publication (no pending rows remain)", async () => {
+		const root = createTempDir();
+		const env = new NodeExecutionEnv({ cwd: root });
+		const repo = new SqliteSessionRepository({
+			env,
+			sqlite: createNodeSqliteFactory(),
+			databasePath: join(root, "sessions.sqlite"),
+		});
+		ownedRepositories.push(repo);
+		const session = await repo.create({ cwd: root, id: "session-1" });
+		const finalized: MessageFinalizedEvent[] = [];
+		const harness = new AgentHarness({
+			models,
+			session,
+			model: newFaux().getModel(),
+			systemPrompt: "You are helpful.",
+		});
+		harness.subscribe((event) => {
+			if (event.type === "message_finalized") finalized.push(event as MessageFinalizedEvent);
+		});
+
+		await harness.appendMessage(createUserMessage("normal path"));
+
+		expect(finalized.length).toBe(1);
+		expect(await session.readPendingCommitReceipts()).toEqual([]);
+		expect(await harness.recoverPendingCommitReceipts()).toBe(0);
+		expect(finalized.length).toBe(1);
 	});
 });

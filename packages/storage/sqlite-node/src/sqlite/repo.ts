@@ -1,4 +1,5 @@
 import type {
+	SessionCommitReceipt,
 	SessionForkOptions,
 	SessionForkSelection,
 	SessionRepository,
@@ -229,7 +230,34 @@ class SqliteSessionBackend {
 			getLabel: (id) => this.read(metadata, (current) => current.getLabel(id)),
 			getName: () => this.read(metadata, (current) => current.getName()),
 			getStats: () => this.read(metadata, (current) => current.getStats()),
+			appendEntryWithReceipt: (entry, receipt) => this.appendEntryWithReceipt(metadata, entry, receipt),
+			readPendingCommitReceipts: () => this.read(metadata, (current) => current.readPendingCommitReceipts()),
+			ackCommitReceipt: (entryId) => this.ackCommitReceipt(metadata, entryId),
 		};
+	}
+
+	private appendEntryWithReceipt(
+		metadata: SqliteSessionMetadata,
+		entry: SessionTreeEntry,
+		receipt: SessionCommitReceipt,
+	): Promise<void> {
+		this.assertOpen();
+		return this.operations.enqueue(async () => {
+			const connection =
+				this.writers.get(metadata.id) ?? (await SqliteSessionConnection.open(await this.getDatabase(), metadata));
+			this.writers.set(metadata.id, connection);
+			await connection.appendEntryWithReceipt(entry, receipt);
+		});
+	}
+
+	private ackCommitReceipt(metadata: SqliteSessionMetadata, entryId: string): Promise<void> {
+		this.assertOpen();
+		return this.operations.enqueue(async () => {
+			const connection =
+				this.writers.get(metadata.id) ?? (await SqliteSessionConnection.open(await this.getDatabase(), metadata));
+			this.writers.set(metadata.id, connection);
+			await connection.ackCommitReceipt(entryId);
+		});
 	}
 
 	private read<T>(

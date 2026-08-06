@@ -102,7 +102,11 @@ describe("SQLite migrations", () => {
 		const db = await sqlite.open(databasePath);
 		try {
 			const rows = await db.prepare("SELECT id FROM migrations ORDER BY id").all<{ id: string }>();
-			expect(rows.map((row) => row.id)).toEqual(["001_initial.sql", "002_branch_tips.sql"]);
+			expect(rows.map((row) => row.id)).toEqual([
+				"001_initial.sql",
+				"002_branch_tips.sql",
+				"003_commit_receipts.sql",
+			]);
 			const tables = await db
 				.prepare("SELECT name, sql FROM sqlite_master WHERE type = 'table' ORDER BY name")
 				.all<{ name: string; sql: string | null }>();
@@ -166,7 +170,7 @@ describe("SQLite migrations", () => {
 			).toBeDefined();
 			expect(
 				(await db.prepare("SELECT id FROM migrations ORDER BY id").all<{ id: string }>()).map((row) => row.id),
-			).toEqual(["001_initial.sql", "002_branch_tips.sql"]);
+			).toEqual(["001_initial.sql", "002_branch_tips.sql", "003_commit_receipts.sql"]);
 		} finally {
 			await db.close();
 		}

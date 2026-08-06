@@ -651,16 +651,31 @@ export class AgentHarness<
 	 * method throws and no receipt/event is produced (no phantom receipts).
 	 * afterAppend runs between the durable append and the receipt publication
 	 * so callers can preserve their existing observer-event ordering.
+	 *
+	 * Crash consistency (iris_agent#40 / Feature 2): when the session storage
+	 * implements the commit journal, the durable append and the pending receipt
+	 * are persisted atomically; the receipt is acknowledged only after
+	 * `message_finalized` has been published. A crash between the durable
+	 * append and the publication leaves the receipt pending, and
+	 * {@link AgentHarness.recoverPendingCommitReceipts} replays it on restart.
+	 * Replay never re-appends and never re-runs afterAppend, so it cannot
+	 * duplicate semantic commits; receipt identity (sessionId + entryId +
+	 * contentHash) stays stable across replay.
 	 */
 	private async appendAndCommitMessage(
 		message: AgentMessage,
 		signal?: AbortSignal,
 		afterAppend?: () => Promise<void>,
 	): Promise<void> {
-		const entryId = await this.session.appendMessage(message);
-		await afterAppend?.();
 		const sessionMetadata = await this.session.getMetadata();
 		const contentHash = await computeMessageContentHash(message);
+		const { entryId, receipt } = await this.session.appendMessageWithCommitReceipt(message, (committedEntryId) => ({
+			sessionId: sessionMetadata.id,
+			entryId: committedEntryId,
+			contentHash,
+			committedAt: new Date().toISOString(),
+		}));
+		await afterAppend?.();
 		await this.emitOwn(
 			{
 				type: "message_finalized",
@@ -668,15 +683,49 @@ export class AgentHarness<
 				role: message.role,
 				contentHash,
 				message,
-				receipt: {
-					sessionId: sessionMetadata.id,
-					entryId,
-					contentHash,
-					committedAt: new Date().toISOString(),
-				},
+				receipt,
 			},
 			signal,
 		);
+		// Published: the journal entry can be replayed no more. A crash between
+		// the durable append and this ack leaves the receipt pending so restart
+		// recovery replays it (consumer dedupes on stable receipt identity).
+		await this.session.ackCommitReceipt(entryId);
+	}
+
+	/**
+	 * Crash recovery (iris_agent#40 / Feature 2): replays `message_finalized`
+	 * for every durably recorded receipt that was not yet acknowledged (i.e.
+	 * published) before a crash. Replay emits the same canonical event with the
+	 * same stable receipt identity (sessionId + entryId + contentHash) and
+	 * never re-appends the message, so it cannot duplicate a semantic commit.
+	 * Pending receipts are replayed in commit order. Returns the number of
+	 * receipts replayed. Call after subscribing, before running new turns, when
+	 * reopening a session after a crash.
+	 */
+	async recoverPendingCommitReceipts(): Promise<number> {
+		const pending = await this.session.readPendingCommitReceipts();
+		let replayed = 0;
+		for (const receipt of pending) {
+			const entry = await this.session.getEntry(receipt.entryId);
+			if (!entry || entry.type !== "message") {
+				throw new AgentHarnessError(
+					"session",
+					`Pending commit receipt ${receipt.entryId} has no recoverable message entry`,
+				);
+			}
+			await this.emitOwn({
+				type: "message_finalized",
+				entryId: receipt.entryId,
+				role: entry.message.role,
+				contentHash: receipt.contentHash,
+				message: entry.message,
+				receipt,
+			});
+			await this.session.ackCommitReceipt(receipt.entryId);
+			replayed++;
+		}
+		return replayed;
 	}
 
 	private async handleAgentEvent(event: AgentEvent, signal?: AbortSignal): Promise<void> {

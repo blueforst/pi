@@ -1,4 +1,5 @@
 import type {
+	SessionCommitReceipt,
 	SessionForkOptions,
 	SessionForkSelection,
 	SessionMetadata,
@@ -22,6 +23,8 @@ export type InMemorySessionCreateOptions = { id?: string };
 interface InMemorySessionState {
 	metadata: SessionMetadata;
 	entries: ArraySessionIndex;
+	/** Crash-consistent commit journal: entryId -> pending receipt (commit order). */
+	pendingReceipts: SessionCommitReceipt[];
 }
 
 export class InMemorySessionBackend {
@@ -37,6 +40,7 @@ export class InMemorySessionBackend {
 			const state: InMemorySessionState = {
 				metadata: { id, createdAt: createTimestamp() },
 				entries: new ArraySessionIndex(),
+				pendingReceipts: [],
 			};
 			this.sessions.set(id, state);
 			return this.storage(state);
@@ -74,6 +78,7 @@ export class InMemorySessionBackend {
 			const state: InMemorySessionState = {
 				metadata: { id, createdAt: createTimestamp() },
 				entries: new ArraySessionIndex(await sourceEntries),
+				pendingReceipts: [],
 			};
 			this.sessions.set(id, state);
 			return this.storage(state);
@@ -104,7 +109,36 @@ export class InMemorySessionBackend {
 			getLabel: (id) => read((entries) => entries.getLabel(id)),
 			getName: () => read((entries) => entries.getName()),
 			getStats: () => read((entries) => entries.getStats()),
+			appendEntryWithReceipt: (entry, receipt) => this.appendEntryWithReceipt(state.metadata, entry, receipt),
+			readPendingCommitReceipts: () => this.readPendingCommitReceipts(state.metadata),
+			ackCommitReceipt: (entryId) => this.ackCommitReceipt(state.metadata, entryId),
 		};
+	}
+
+	private appendEntryWithReceipt(
+		metadata: SessionMetadata,
+		entry: SessionTreeEntry,
+		receipt: SessionCommitReceipt,
+	): Promise<void> {
+		this.assertOpen();
+		return this.operations.enqueue(metadata.id, () => {
+			const state = this.getState(metadata);
+			state.entries.append(entry);
+			state.pendingReceipts.push(receipt);
+		});
+	}
+
+	private readPendingCommitReceipts(metadata: SessionMetadata): Promise<readonly SessionCommitReceipt[]> {
+		this.assertOpen();
+		return this.operations.enqueue(metadata.id, () => [...this.getState(metadata).pendingReceipts]);
+	}
+
+	private ackCommitReceipt(metadata: SessionMetadata, entryId: string): Promise<void> {
+		this.assertOpen();
+		return this.operations.enqueue(metadata.id, () => {
+			const state = this.getState(metadata);
+			state.pendingReceipts = state.pendingReceipts.filter((receipt) => receipt.entryId !== entryId);
+		});
 	}
 
 	private appendEntry(metadata: SessionMetadata, entry: SessionTreeEntry): Promise<void> {

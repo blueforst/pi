@@ -1,5 +1,6 @@
 import type {
 	SessionBranchQuery,
+	SessionCommitReceipt,
 	SessionEntryCursorOptions,
 	SessionStats,
 	SessionTreeEntry,
@@ -416,6 +417,46 @@ export class SqliteSessionConnection {
 			if (error instanceof SessionError) throw error;
 			throw new SessionError("storage", `Failed to append SQLite session entry ${entry.id}`, toError(error));
 		}
+	}
+
+	/**
+	 * Crash-consistent append (iris_agent#40 / Feature 2): appends the entry
+	 * and its pending commit receipt in the same transaction, so a crash
+	 * between the durable append and the `message_finalized` publication
+	 * leaves a recoverable pending receipt. The harness acknowledges the
+	 * receipt after publication; unacknowledged rows are replayed on restart.
+	 */
+	async appendEntryWithReceipt(entry: SessionTreeEntry, receipt: SessionCommitReceipt): Promise<void> {
+		await this.db.transaction(async () => {
+			await this.appendEntry(entry, { transaction: false });
+			await this.db
+				.prepare(
+					"INSERT INTO session_commit_receipts (session_id, entry_id, content_hash, committed_at, acked) VALUES (?, ?, ?, ?, 0)",
+				)
+				.run(this.metadata.id, receipt.entryId, receipt.contentHash, receipt.committedAt);
+		});
+	}
+
+	/** Pending (recorded, not yet acknowledged) receipts in commit order. */
+	async readPendingCommitReceipts(): Promise<readonly SessionCommitReceipt[]> {
+		const rows = await this.db
+			.prepare(
+				"SELECT entry_id, content_hash, committed_at FROM session_commit_receipts WHERE session_id = ? AND acked = 0 ORDER BY committed_at, entry_id",
+			)
+			.all<{ entry_id: string; content_hash: string; committed_at: string }>(this.metadata.id);
+		return rows.map((row) => ({
+			sessionId: this.metadata.id,
+			entryId: row.entry_id,
+			contentHash: row.content_hash,
+			committedAt: row.committed_at,
+		}));
+	}
+
+	/** Marks a receipt as published; crash recovery skips it afterwards. */
+	async ackCommitReceipt(entryId: string): Promise<void> {
+		await this.db
+			.prepare("UPDATE session_commit_receipts SET acked = 1 WHERE session_id = ? AND entry_id = ?")
+			.run(this.metadata.id, entryId);
 	}
 
 	async readEntry(id: string): Promise<SessionTreeEntry | undefined> {
