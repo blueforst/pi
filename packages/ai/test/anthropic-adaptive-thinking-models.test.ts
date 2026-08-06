@@ -2,20 +2,50 @@ import { describe, expect, it } from "vitest";
 import { getModels, getProviders } from "../src/compat.ts";
 import type { Api, Model } from "../src/types.ts";
 
+// Expectations are derived from the committed model-data snapshot
+// (src/providers/data/.manifest.json), which is hermetic: the CI build never
+// re-resolves these from live upstream catalogs. When the snapshot is
+// refreshed explicitly (`npm run hydrate:model-data`), regenerate this list
+// from the snapshot instead of hand-picking transient catalog members.
 const EXPECTED_CURRENT_ADAPTIVE_THINKING_MODELS = [
 	"anthropic/claude-fable-5",
+	"anthropic/claude-opus-4-6",
+	"anthropic/claude-opus-4-7",
 	"anthropic/claude-opus-4-8",
 	"anthropic/claude-opus-5",
+	"anthropic/claude-sonnet-4-6",
 	"anthropic/claude-sonnet-5",
 	"cloudflare-ai-gateway/claude-fable-5",
-	"kimi-coding/kimi-for-coding",
+	"cloudflare-ai-gateway/claude-opus-4-6",
+	"cloudflare-ai-gateway/claude-opus-4-7",
+	"cloudflare-ai-gateway/claude-opus-4-8",
+	"cloudflare-ai-gateway/claude-opus-5",
+	"cloudflare-ai-gateway/claude-sonnet-4-6",
+	"cloudflare-ai-gateway/claude-sonnet-5",
+	"github-copilot/claude-opus-4.6",
+	"github-copilot/claude-opus-4.7",
+	"github-copilot/claude-opus-4.8",
+	"github-copilot/claude-opus-5",
+	"github-copilot/claude-sonnet-4.6",
+	"github-copilot/claude-sonnet-5",
 	"kimi-coding/k3",
+	"kimi-coding/k3-256k",
+	"kimi-coding/kimi-for-coding",
 	"kimi-coding/kimi-for-coding-highspeed",
+	"opencode/claude-fable-5",
+	"opencode/claude-opus-4-6",
+	"opencode/claude-opus-4-7",
 	"opencode/claude-opus-4-8",
 	"opencode/claude-opus-5",
+	"opencode/claude-sonnet-4-6",
+	"opencode/claude-sonnet-5",
+	"vercel-ai-gateway/anthropic/claude-fable-5",
+	"vercel-ai-gateway/anthropic/claude-opus-4.6",
+	"vercel-ai-gateway/anthropic/claude-opus-4.7",
 	"vercel-ai-gateway/anthropic/claude-opus-4.8",
+	"vercel-ai-gateway/anthropic/claude-opus-4.8-fast",
 	"vercel-ai-gateway/anthropic/claude-opus-5",
-	"vercel-ai-gateway/anthropic/claude-opus-5-fast",
+	"vercel-ai-gateway/anthropic/claude-sonnet-4.6",
 	"vercel-ai-gateway/anthropic/claude-sonnet-5",
 ];
 

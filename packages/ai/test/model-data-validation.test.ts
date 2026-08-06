@@ -71,7 +71,9 @@ function writeFixtureData(
 	const filename = "test-provider.json";
 	const content = `${JSON.stringify({ [apiGroup]: values })}\n`;
 	writeFileSync(join(dataDir, filename), content);
-	const manifest = createModelDataManifest(structure, { [filename]: content }, GENERATED_AT);
+	const manifest = createModelDataManifest(structure, { [filename]: content }, GENERATED_AT, [
+		{ name: "models.dev", url: "https://models.dev/api.json", fetchedAt: GENERATED_AT, status: "ok" },
+	]);
 	manifest.schemaVersion = manifestSchemaVersion;
 	writeFileSync(join(dataDir, MODEL_DATA_MANIFEST_FILE), `${JSON.stringify(manifest)}\n`);
 }
@@ -121,7 +123,9 @@ describe("generated model data validation", () => {
 			"anthropic-messages": fixture.values,
 		})}\n`;
 		writeFileSync(join(fixture.dataDir, filename), content);
-		const manifest = createModelDataManifest(fixture.structure, { [filename]: content }, GENERATED_AT);
+		const manifest = createModelDataManifest(fixture.structure, { [filename]: content }, GENERATED_AT, [
+			{ name: "models.dev", url: "https://models.dev/api.json", fetchedAt: GENERATED_AT, status: "ok" },
+		]);
 		writeFileSync(join(fixture.dataDir, MODEL_DATA_MANIFEST_FILE), `${JSON.stringify(manifest)}\n`);
 		expect(() => validateModelDataDirectory(fixture.structure, fixture.dataDir)).toThrow("more than one API group");
 	});
@@ -151,6 +155,26 @@ describe("generated model data validation", () => {
 		manifest.generatedAt = "invalid";
 		writeFileSync(manifestPath, `${JSON.stringify(manifest)}\n`);
 		expect(() => validateModelDataDirectory(fixture.structure, fixture.dataDir)).toThrow("generation timestamp");
+	});
+
+	it("rejects a manifest without source metadata", () => {
+		const fixture = createFixture();
+		const manifestPath = join(fixture.dataDir, MODEL_DATA_MANIFEST_FILE);
+		const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as Record<string, unknown>;
+		delete manifest.sources;
+		writeFileSync(manifestPath, `${JSON.stringify(manifest)}\n`);
+		expect(() => validateModelDataDirectory(fixture.structure, fixture.dataDir)).toThrow("no source metadata");
+	});
+
+	it("rejects malformed source metadata", () => {
+		const fixture = createFixture();
+		const manifestPath = join(fixture.dataDir, MODEL_DATA_MANIFEST_FILE);
+		const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as Record<string, unknown>;
+		manifest.sources = [
+			{ name: "models.dev", url: "https://models.dev/api.json", fetchedAt: "not-a-date", status: "ok" },
+		];
+		writeFileSync(manifestPath, `${JSON.stringify(manifest)}\n`);
+		expect(() => validateModelDataDirectory(fixture.structure, fixture.dataDir)).toThrow("malformed source metadata");
 	});
 
 	it("rejects missing provider shards imported by the aggregator", () => {
