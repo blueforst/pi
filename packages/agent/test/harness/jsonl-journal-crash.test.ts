@@ -236,6 +236,55 @@ describe("JSONL framed journal crash-safety (iris_agent#51)", () => {
 		await reopenedRepo[Symbol.asyncDispose]();
 	});
 
+	it("never loses a committed pair when appending after a missing-newline tail (review finding, iris_agent#51)", async () => {
+		const root = createTempDir();
+		const fs = new NodeExecutionEnv({ cwd: root });
+		const repo = new JsonlSessionRepository({ fs, sessionsRoot: root });
+		const session = await repo.create({ cwd: root, id: "tail-guard" });
+		const metadata = await session.getMetadata();
+
+		const first = createUserMessage("first pair");
+		const second = createUserMessage("second pair");
+		const hash1 = await computeMessageContentHash(first);
+		const hash2 = await computeMessageContentHash(second);
+		await session.appendMessageWithCommitReceipt(first, (id) => receiptFor(id, hash1));
+		await session.appendMessageWithCommitReceipt(second, (id) => receiptFor(id, hash2));
+		const sessionPath = metadata.path;
+		await repo[Symbol.asyncDispose]();
+
+		// Simulate a torn tail that still contains the COMPLETE second frame
+		// but lost its trailing newline (e.g. interrupted write at the byte
+		// boundary after the JSON, before the delimiter).
+		const full = readFileSync(sessionPath, "utf8");
+		writeFileSync(sessionPath, full.slice(0, full.length - 1));
+
+		// Reopen: both complete pairs must still be readable.
+		{
+			const { session: reopened, repo: reopenedRepo } = await openSessionFile(sessionPath);
+			expect((await reopened.getEntries()).length).toBe(2);
+			expect((await reopened.readPendingCommitReceipts()).length).toBe(2);
+			expect(await reopened.journalDiagnostics()).toEqual([]);
+			await reopenedRepo[Symbol.asyncDispose]();
+		}
+
+		// Appending the THIRD frame must not concatenate onto the trailing
+		// line: the append guard emits the missing newline first, so the
+		// previously committed pair survives and the new frame is its own line.
+		{
+			const { session: reopened, repo: reopenedRepo } = await openSessionFile(sessionPath);
+			const third = createUserMessage("third pair after torn newline");
+			const hash3 = await computeMessageContentHash(third);
+			await reopened.appendMessageWithCommitReceipt(third, (id) => receiptFor(id, hash3));
+			const entries = await reopened.getEntries();
+			expect(entries.length).toBe(3);
+			const pending = await reopened.readPendingCommitReceipts();
+			expect(pending.length).toBe(3);
+			expect(pending.map((r) => r.entrySeq)).toEqual([1, 2, 3]);
+			expect(await reopened.journalDiagnostics()).toEqual([]);
+			await reopenedRepo[Symbol.asyncDispose]();
+		}
+	});
+
 	it("recovery stays idempotent across restarts: acked pairs never re-emit", async () => {
 		const root = createTempDir();
 		const fs = new NodeExecutionEnv({ cwd: root });

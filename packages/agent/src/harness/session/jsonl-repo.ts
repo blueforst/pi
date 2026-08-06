@@ -254,6 +254,7 @@ async function loadJsonlSession(fs: JsonlSessionFileSystem, path: string): Promi
 		pendingReceipts,
 		diagnostics,
 		maxJournalSeq,
+		tailEndsWithNewline: content.endsWith("\n"),
 	};
 }
 
@@ -399,6 +400,8 @@ interface JsonlSessionLoadResult {
 	 * seqs would reuse a seq after an ack (violating monotonicity).
 	 */
 	maxJournalSeq: number;
+	/** Whether the file tail ends with a newline (torn-tail append guard). */
+	tailEndsWithNewline: boolean;
 }
 
 function encodeCwd(cwd: string): string {
@@ -434,6 +437,15 @@ export class JsonlSessionBackend {
 	private readonly journalSeqsByPath = new Map<string, number>();
 	/** iris_agent#51: torn-tail / corruption diagnostics from the latest load. */
 	private readonly loadDiagnosticsByPath = new Map<string, string[]>();
+	/**
+	 * iris_agent#51: whether the file tail (as of the last full read) ends
+	 * with a newline. When false, the next append MUST first emit a newline —
+	 * otherwise the new frame is concatenated onto the trailing partial line,
+	 * the merged line fails to parse, and the whole line (including the
+	 * previously COMPLETE frame written before the torn tail) is quarantined
+	 * as one unit, losing a committed pair (review finding, iris_agent#51).
+	 */
+	private readonly newlineTailsByPath = new Map<string, boolean>();
 	private readonly operations: KeyedOperationQueue<string>;
 	private disposed = false;
 	private disposePromise: Promise<void> | undefined;
@@ -473,6 +485,7 @@ export class JsonlSessionBackend {
 		else this.entryIndexesByPath.set(metadata.path, new ArraySessionIndex(document.entries));
 		this.loadDiagnosticsByPath.set(metadata.path, document.diagnostics);
 		this.journalSeqsByPath.set(metadata.path, document.maxJournalSeq);
+		this.newlineTailsByPath.set(metadata.path, document.tailEndsWithNewline);
 		return document.metadata;
 	}
 
@@ -510,12 +523,30 @@ export class JsonlSessionBackend {
 				entries = this.entryIndexesByPath.get(metadata.path)!;
 			}
 			if (entries.has(entry.id)) throw new SessionError("invalid_entry", `Entry ${entry.id} already exists`);
+			await this.ensureTrailingNewline(metadata.path);
 			getFileSystemResultOrThrow(
 				await this.fs.appendFile(metadata.path, `${JSON.stringify(entry)}\n`),
 				`Failed to append session entry ${entry.id}`,
 			);
 			entries.append(entry);
 		});
+	}
+
+	/**
+	 * iris_agent#51 torn-tail append guard: appends a newline when the file
+	 * tail is known (or assumed) to lack one. Without this, a new frame or
+	 * marker would be concatenated onto the trailing partial line; the merged
+	 * line then fails to parse and the WHOLE line — including any complete
+	 * frame written before the torn tail — is quarantined as one unit,
+	 * silently losing a previously committed pair.
+	 */
+	private async ensureTrailingNewline(path: string): Promise<void> {
+		if (this.newlineTailsByPath.get(path) !== false) return;
+		getFileSystemResultOrThrow(
+			await this.fs.appendFile(path, "\n"),
+			`Failed to repair newline tail of ${path} before append`,
+		);
+		this.newlineTailsByPath.set(path, true);
 	}
 
 	delete(metadata: JsonlSessionMetadata): Promise<void> {
@@ -608,6 +639,7 @@ export class JsonlSessionBackend {
 		getFileSystemResultOrThrow(await this.fs.writeFile(path, content), `Failed to create session ${path}`);
 		this.entryIndexesByPath.set(path, new ArraySessionIndex(entries));
 		this.operationKeysByPath.set(path, descriptor.operationKey);
+		this.newlineTailsByPath.set(path, true);
 		return metadataFromHeader(header, path);
 	}
 
@@ -674,6 +706,7 @@ export class JsonlSessionBackend {
 			if (entries.has(entry.id)) throw new SessionError("invalid_entry", `Entry ${entry.id} already exists`);
 			const seq = (this.journalSeqsByPath.get(metadata.path) ?? 0) + 1;
 			const line = await encodeJournalFrame(seq, entry, receipt);
+			await this.ensureTrailingNewline(metadata.path);
 			getFileSystemResultOrThrow(
 				await this.fs.appendFile(metadata.path, `${line}\n`),
 				`Failed to append session entry ${entry.id}`,
@@ -701,6 +734,7 @@ export class JsonlSessionBackend {
 			const document = await loadJsonlSession(this.fs, metadata.path);
 			this.loadDiagnosticsByPath.set(metadata.path, document.diagnostics);
 			this.journalSeqsByPath.set(metadata.path, document.maxJournalSeq);
+			this.newlineTailsByPath.set(metadata.path, document.tailEndsWithNewline);
 			return [...document.pendingReceipts].sort((a, b) => a.order - b.order).map((pending) => pending.receipt);
 		});
 	}
@@ -720,6 +754,7 @@ export class JsonlSessionBackend {
 				throw new SessionError("not_found", `Session not found: ${metadata.path}`);
 			}
 			const marker = JSON.stringify({ __piReceiptAck: true, entryId });
+			await this.ensureTrailingNewline(metadata.path);
 			getFileSystemResultOrThrow(
 				await this.fs.appendFile(metadata.path, `${marker}\n`),
 				`Failed to acknowledge receipt for entry ${entryId}`,
