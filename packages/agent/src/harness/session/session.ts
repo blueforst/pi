@@ -12,6 +12,7 @@ import type {
 	MessageEntry,
 	ModelChangeEntry,
 	SessionBranchQuery,
+	SessionCommitReceipt,
 	SessionContext,
 	SessionEntryCursorOptions,
 	SessionInfoEntry,
@@ -252,6 +253,74 @@ export class Session<TMetadata extends SessionMetadata = SessionMetadata> {
 			() => undefined,
 		);
 		return commit;
+	}
+
+	/**
+	 * Crash-consistent append variant (iris_agent#40 / Feature 2): persists the
+	 * entry and its pending commit receipt atomically when the storage backend
+	 * implements the commit journal, and falls back to the plain append path
+	 * otherwise. The returned receipt is exactly the one the caller must
+	 * publish (e.g. inside `message_finalized`); after publication the caller
+	 * acknowledges it with {@link ackCommitReceipt} so crash recovery does not
+	 * replay it.
+	 */
+	private enqueueAppendWithReceipt<TEntry extends SessionTreeEntry>(
+		createEntry: (base: Pick<SessionTreeEntry, "id" | "parentId" | "timestamp">) => TEntry,
+		createReceipt: (entry: TEntry) => SessionCommitReceipt,
+	): Promise<{ entry: TEntry; receipt: SessionCommitReceipt }> {
+		const commit = this.appendTail.then(async () => {
+			const entry = createEntry({
+				id: await this.createEntryId(),
+				parentId: this.leafId,
+				timestamp: new Date().toISOString(),
+			});
+			const receipt = createReceipt(entry);
+			if (this.storage.appendEntryWithReceipt) {
+				await this.storage.appendEntryWithReceipt(entry, receipt);
+			} else {
+				await this.storage.appendEntry(entry);
+			}
+			this.leafId = entry.type === "leaf" ? entry.targetId : entry.id;
+			return { entry, receipt };
+		});
+		this.appendTail = commit.then(
+			() => undefined,
+			() => undefined,
+		);
+		return commit;
+	}
+
+	/**
+	 * Durable message append that atomically records its pending commit
+	 * receipt when the storage backend supports the commit journal. Returns
+	 * the committed entry id and the receipt to publish. A crash between this
+	 * call and publishing the receipt leaves the receipt pending so
+	 * {@link AgentHarness.recoverPendingCommitReceipts} can replay it.
+	 */
+	async appendMessageWithCommitReceipt(
+		message: AgentMessage,
+		createReceipt: (entryId: string, entry: MessageEntry) => SessionCommitReceipt,
+	): Promise<{ entryId: string; receipt: SessionCommitReceipt }> {
+		const { entry, receipt } = await this.enqueueAppendWithReceipt(
+			(base) =>
+				({
+					...base,
+					type: "message",
+					message,
+				}) satisfies MessageEntry,
+			(entry) => createReceipt(entry.id, entry),
+		);
+		return { entryId: entry.id, receipt };
+	}
+
+	/** Pending (durably recorded, not yet acknowledged) commit receipts, in commit order. */
+	async readPendingCommitReceipts(): Promise<readonly SessionCommitReceipt[]> {
+		return (await this.storage.readPendingCommitReceipts?.()) ?? [];
+	}
+
+	/** Marks a commit receipt as published; crash recovery skips it afterwards. */
+	async ackCommitReceipt(entryId: string): Promise<void> {
+		await this.storage.ackCommitReceipt?.(entryId);
 	}
 
 	private async setLeafId(leafId: string | null): Promise<LeafEntry> {

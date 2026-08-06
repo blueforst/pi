@@ -568,6 +568,17 @@ export interface SessionStorage<TMetadata extends SessionMetadata = SessionMetad
 	getLabel(id: string): Promise<string | undefined>;
 	getName(): Promise<string | undefined>;
 	getStats(): Promise<SessionStats>;
+	/**
+	 * Optional crash-consistent commit journal (iris_agent#40 / Feature 2).
+	 * When present, `appendEntryWithReceipt` persists the entry and its
+	 * pending commit receipt atomically, `readPendingCommitReceipts` returns
+	 * receipts recorded but not yet acknowledged, and `ackCommitReceipt`
+	 * marks a receipt published. Backends without a journal degrade to the
+	 * plain append path (receipts are publish-only, no replay after crash).
+	 */
+	appendEntryWithReceipt?(entry: SessionTreeEntry, receipt: SessionCommitReceipt): Promise<void>;
+	readPendingCommitReceipts?(): Promise<readonly SessionCommitReceipt[]>;
+	ackCommitReceipt?(entryId: string): Promise<void>;
 }
 
 export interface JsonlSessionCreateOptions extends SessionCreateOptions {

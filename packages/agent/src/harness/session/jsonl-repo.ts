@@ -3,6 +3,7 @@ import type {
 	JsonlSessionCreateOptions,
 	JsonlSessionListOptions,
 	JsonlSessionMetadata,
+	SessionCommitReceipt,
 	SessionForkOptions,
 	SessionForkSelection,
 	SessionStorage,
@@ -171,7 +172,10 @@ async function loadJsonlSession(fs: JsonlSessionFileSystem, path: string): Promi
 	const lines = content.split("\n").filter((line) => line.trim());
 	if (lines.length === 0) throw invalidSession(path, "missing session header");
 	const header = parseHeader(lines[0]!, path);
-	const entries = lines.slice(1).map((line, index) => parseEntry(line, path, index + 2));
+	// Skip crash-journal marker lines (pending receipt records and ack marks);
+	// they are not session entries and must not corrupt the entry index.
+	const entryLines = lines.slice(1).filter((line) => !isReceiptJournalLine(line));
+	const entries = entryLines.map((line, index) => parseEntry(line, path, index + 2));
 	const entryIds = new Set<string>();
 	for (const entry of entries) {
 		if (entryIds.has(entry.id)) throw invalidSession(path, `duplicate entry id ${entry.id}`);
@@ -181,6 +185,11 @@ async function loadJsonlSession(fs: JsonlSessionFileSystem, path: string): Promi
 		metadata: metadataFromHeader(header, path),
 		entries,
 	};
+}
+
+/** True for crash-journal marker lines appended by appendEntryWithReceipt/ackCommitReceipt. */
+function isReceiptJournalLine(line: string): boolean {
+	return line.includes('"__piReceipt"') || line.includes("__piReceiptAck");
 }
 
 function encodeCwd(cwd: string): string {
@@ -405,7 +414,84 @@ export class JsonlSessionBackend {
 			getLabel: (id) => this.readIndex(metadata, (entries) => entries.getLabel(id)),
 			getName: () => this.readIndex(metadata, (entries) => entries.getName()),
 			getStats: () => this.readIndex(metadata, (entries) => entries.getStats()),
+			appendEntryWithReceipt: (entry, receipt) => this.appendEntryWithReceipt(metadata, entry, receipt),
+			readPendingCommitReceipts: () => this.readPendingCommitReceipts(metadata),
+			ackCommitReceipt: (entryId) => this.ackCommitReceipt(metadata, entryId),
 		};
+	}
+
+	/**
+	 * Crash-journal append (iris_agent#40 / Feature 2): writes the entry line
+	 * and its pending receipt marker in a single appendFile call so the pair
+	 * is durable together. The marker line carries `__piReceipt` and is skipped
+	 * by loadJsonlSession so it never enters the entry index.
+	 */
+	private appendEntryWithReceipt(
+		metadata: JsonlSessionMetadata,
+		entry: SessionTreeEntry,
+		receipt: SessionCommitReceipt,
+	): Promise<void> {
+		this.assertOpen();
+		return this.operations.enqueue(this.operationKey(metadata), async () => {
+			if (
+				!getFileSystemResultOrThrow(await this.fs.exists(metadata.path), `Failed to check session ${metadata.path}`)
+			) {
+				throw new SessionError("not_found", `Session not found: ${metadata.path}`);
+			}
+			let entries = this.entryIndexesByPath.get(metadata.path);
+			if (!entries) {
+				await this.loadDocument(metadata);
+				entries = this.entryIndexesByPath.get(metadata.path)!;
+			}
+			if (entries.has(entry.id)) throw new SessionError("invalid_entry", `Entry ${entry.id} already exists`);
+			const marker = JSON.stringify({ __piReceipt: true, receipt });
+			getFileSystemResultOrThrow(
+				await this.fs.appendFile(metadata.path, `${JSON.stringify(entry)}\n${marker}\n`),
+				`Failed to append session entry ${entry.id}`,
+			);
+			entries.append(entry);
+		});
+	}
+
+	/** Pending (recorded, not yet acked) receipts in commit order. */
+	private async readPendingCommitReceipts(metadata: JsonlSessionMetadata): Promise<readonly SessionCommitReceipt[]> {
+		this.assertOpen();
+		return this.operations.enqueue(this.operationKey(metadata), async () => {
+			const content = getFileSystemResultOrThrow(
+				await this.fs.readTextFile(metadata.path),
+				`Failed to read session ${metadata.path}`,
+			);
+			const pending = new Map<string, SessionCommitReceipt>();
+			for (const line of content.split("\n")) {
+				const trimmed = line.trim();
+				if (!trimmed) continue;
+				if (trimmed.includes('"__piReceipt"')) {
+					const value = JSON.parse(trimmed) as { __piReceipt?: boolean; receipt?: SessionCommitReceipt };
+					if (value.__piReceipt && value.receipt) pending.set(value.receipt.entryId, value.receipt);
+				} else if (trimmed.includes("__piReceiptAck")) {
+					const value = JSON.parse(trimmed) as { __piReceiptAck?: boolean; entryId?: string };
+					if (value.__piReceiptAck && value.entryId) pending.delete(value.entryId);
+				}
+			}
+			return [...pending.values()];
+		});
+	}
+
+	/** Appends an append-only ack marker; replay skips acked entry ids. */
+	private ackCommitReceipt(metadata: JsonlSessionMetadata, entryId: string): Promise<void> {
+		this.assertOpen();
+		return this.operations.enqueue(this.operationKey(metadata), async () => {
+			if (
+				!getFileSystemResultOrThrow(await this.fs.exists(metadata.path), `Failed to check session ${metadata.path}`)
+			) {
+				throw new SessionError("not_found", `Session not found: ${metadata.path}`);
+			}
+			const marker = JSON.stringify({ __piReceiptAck: true, entryId });
+			getFileSystemResultOrThrow(
+				await this.fs.appendFile(metadata.path, `${marker}\n`),
+				`Failed to acknowledge receipt for entry ${entryId}`,
+			);
+		});
 	}
 
 	private entryIndex(path: string): ArraySessionIndex {
