@@ -309,6 +309,13 @@ export interface FileSystem {
 	writeFile(path: string, content: string | Uint8Array, abortSignal?: AbortSignal): Promise<Result<void, FileError>>;
 	/** Create or append to a file, creating parent directories when supported. */
 	appendFile(path: string, content: string | Uint8Array, abortSignal?: AbortSignal): Promise<Result<void, FileError>>;
+	/**
+	 * Optional fsync capability (iris_agent#51). When present, implementations
+	 * must flush the file's buffered data to stable storage after an append.
+	 * Used by the JSONL commit journal to draw an explicit durability boundary;
+	 * a backend without this method cannot claim crash-recoverable receipts.
+	 */
+	syncFile?(path: string, abortSignal?: AbortSignal): Promise<Result<void, FileError>>;
 	/** Return metadata for the addressed path without following symlinks. */
 	fileInfo(path: string, abortSignal?: AbortSignal): Promise<Result<FileInfo, FileError>>;
 	/** List direct children of a directory without following symlinks. */
@@ -579,6 +586,21 @@ export interface SessionStorage<TMetadata extends SessionMetadata = SessionMetad
 	appendEntryWithReceipt?(entry: SessionTreeEntry, receipt: SessionCommitReceipt): Promise<void>;
 	readPendingCommitReceipts?(): Promise<readonly SessionCommitReceipt[]>;
 	ackCommitReceipt?(entryId: string): Promise<void>;
+	/**
+	 * Explicit durability capability (iris_agent#51). Implementations that
+	 * persist the entry+receipt pair atomically (SQLite transaction, memory
+	 * ordering, framed JSONL journal with fsync) return true. A backend that
+	 * cannot draw an explicit durability boundary must return false so the
+	 * harness never treats its receipts as crash-recoverable. Absent (legacy
+	 * journal-capable backends) is treated as true.
+	 */
+	supportsCrashRecoverableReceipts?(): boolean;
+	/**
+	 * Diagnostics from the most recent session load (iris_agent#51): torn-tail
+	 * quarantines, checksum failures, legacy framing notes. Empty when the
+	 * load was clean. Exposed for health/readiness consumers; never throws.
+	 */
+	journalDiagnostics?(): readonly string[];
 }
 
 export interface JsonlSessionCreateOptions extends SessionCreateOptions {

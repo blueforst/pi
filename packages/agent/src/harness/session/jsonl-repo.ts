@@ -40,7 +40,7 @@ export type JsonlSessionRepositoryFileSystem = Pick<
 	| "exists"
 	| "createDir"
 	| "remove"
->;
+> & { syncFile?: FileSystem["syncFile"] };
 
 type JsonlSessionFileSystem = Pick<FileSystem, "readTextFile" | "readTextLines" | "writeFile" | "appendFile">;
 
@@ -61,11 +61,6 @@ interface SessionDocumentDescriptor {
 	timestamp: string;
 	fileName: string;
 	operationKey: string;
-}
-
-interface JsonlSessionDocument {
-	metadata: JsonlSessionMetadata;
-	entries: SessionTreeEntry[];
 }
 
 function invalidSession(path: string, message: string, cause?: Error): SessionError {
@@ -167,28 +162,107 @@ export async function loadJsonlSessionMetadata(
 	return metadataFromHeader(parseHeader(lines[0], path), path);
 }
 
-async function loadJsonlSession(fs: JsonlSessionFileSystem, path: string): Promise<JsonlSessionDocument> {
+async function loadJsonlSession(fs: JsonlSessionFileSystem, path: string): Promise<JsonlSessionLoadResult> {
 	const content = getFileSystemResultOrThrow(await fs.readTextFile(path), `Failed to read session ${path}`);
 	const lines = content.split("\n").filter((line) => line.trim());
 	if (lines.length === 0) throw invalidSession(path, "missing session header");
 	const header = parseHeader(lines[0]!, path);
-	// Skip crash-journal marker lines (pending receipt records and ack marks);
-	// they are not session entries and must not corrupt the entry index.
-	const entryLines = lines.slice(1).filter((line) => !isReceiptJournalLine(line));
-	const entries = entryLines.map((line, index) => parseEntry(line, path, index + 2));
+	const entries: SessionTreeEntry[] = [];
+	const pendingReceipts: { receipt: SessionCommitReceipt; order: number }[] = [];
+	const diagnostics: string[] = [];
+	let maxJournalSeq = 0;
 	const entryIds = new Set<string>();
-	for (const entry of entries) {
+
+	for (let i = 1; i < lines.length; i++) {
+		const line = lines[i]!;
+		const lineNumber = i + 1;
+		const isTail = i === lines.length - 1;
+		// Torn-tail quarantine (iris_agent#51): only the LAST line may fail to
+		// parse. A failure there means the append was interrupted mid-write
+		// (short write, power loss, kill -9). The incomplete line is quarantined
+		// with a typed diagnostic — it is never treated as a committed message —
+		// and every earlier COMPLETE frame stays intact. Corruption in the
+		// MIDDLE of the file is a storage fault and fails closed instead.
+		const quarantineTail = (message: string): boolean => {
+			if (!isTail) return false;
+			diagnostics.push(`torn_tail: line ${lineNumber}: ${message}; quarantined`);
+			return true;
+		};
+
+		let value: unknown;
+		try {
+			value = JSON.parse(line);
+		} catch (error) {
+			if (quarantineTail(`line is not valid JSON (${toError(error).message})`)) continue;
+			throw invalidEntry(path, lineNumber, "is not valid JSON", toError(error));
+		}
+		if (typeof value !== "object" || value === null) {
+			if (quarantineTail("line is not an object")) continue;
+			throw invalidEntry(path, lineNumber, "is not a valid session entry");
+		}
+		const record = value as { __piReceipt?: unknown; __piReceiptAck?: unknown; __piJournal?: unknown };
+		if (record.__piReceipt === true) {
+			// Legacy pre-framing marker line: receipt-only; the entry is the
+			// bare entry line written immediately before it. Torn marker tails
+			// are quarantined above, leaving the entry visible with a diagnostic
+			// (never silently — the missing receipt is reported, not hidden).
+			const receipt = (record as { receipt?: SessionCommitReceipt }).receipt;
+			if (!receipt || typeof receipt.entryId !== "string" || !receipt.entryId) {
+				if (quarantineTail("legacy receipt marker is missing its receipt")) continue;
+				throw invalidEntry(path, lineNumber, "legacy receipt marker is missing its receipt");
+			}
+			pendingReceipts.push({ receipt, order: lineNumber });
+			continue;
+		}
+		if (record.__piReceiptAck === true) {
+			const entryId = (record as { entryId?: unknown }).entryId;
+			if (typeof entryId !== "string" || !entryId)
+				throw invalidEntry(path, lineNumber, "receipt ack marker is missing entryId");
+			const index = pendingReceipts.findIndex((p) => p.receipt.entryId === entryId);
+			if (index >= 0) pendingReceipts.splice(index, 1);
+			continue;
+		}
+		if (record.__piJournal === 1) {
+			let frame: { entry: SessionTreeEntry; receipt: SessionCommitReceipt; seq: number } | undefined;
+			try {
+				frame = await parseJournalFrame(line, path, lineNumber);
+			} catch (error) {
+				if (error instanceof SessionError && error.code === "invalid_entry" && quarantineTail(error.message)) {
+					continue;
+				}
+				throw error;
+			}
+			if (frame !== undefined) {
+				if (entryIds.has(frame.entry.id)) throw invalidSession(path, `duplicate entry id ${frame.entry.id}`);
+				entryIds.add(frame.entry.id);
+				entries.push(frame.entry);
+				pendingReceipts.push({ receipt: { ...frame.receipt, entrySeq: frame.seq }, order: frame.seq });
+				maxJournalSeq = Math.max(maxJournalSeq, frame.seq);
+			}
+			continue;
+		}
+		// Bare entry line (plain append path, pre-framing journals, forks).
+		const entry = parseEntry(line, path, lineNumber);
 		if (entryIds.has(entry.id)) throw invalidSession(path, `duplicate entry id ${entry.id}`);
 		entryIds.add(entry.id);
+		entries.push(entry);
 	}
+
 	return {
 		metadata: metadataFromHeader(header, path),
 		entries,
+		pendingReceipts,
+		diagnostics,
+		maxJournalSeq,
 	};
 }
 
-/** True for crash-journal marker lines appended by appendEntryWithReceipt/ackCommitReceipt. */
-function isReceiptJournalLine(line: string): boolean {
+/**
+ * True for crash-journal marker lines appended by appendEntryWithReceipt/ackCommitReceipt.
+ * Kept for legacy-file filtering by external readers; loadJsonlSession classifies
+ * lines structurally instead (see parseJournalFrame / legacy marker handling).
+ */
+export function isReceiptJournalLine(line: string): boolean {
 	let value: unknown;
 	try {
 		value = JSON.parse(line);
@@ -196,10 +270,135 @@ function isReceiptJournalLine(line: string): boolean {
 		return false;
 	}
 	if (typeof value !== "object" || value === null) return false;
-	const record = value as { __piReceipt?: unknown; __piReceiptAck?: unknown };
+	const record = value as { __piReceipt?: unknown; __piReceiptAck?: unknown; __piJournal?: unknown };
 	// Structural check, not substring matching: a legitimate entry whose message
 	// text merely contains "__piReceiptAck" must never be mistaken for a marker.
-	return record.__piReceipt === true || record.__piReceiptAck === true;
+	return record.__piReceipt === true || record.__piReceiptAck === true || record.__piJournal === 1;
+}
+
+/**
+ * iris_agent#51 framed journal v1. A commit frame is ONE line containing the
+ * entry, its pending receipt, a monotonic per-session seq and a checksum over
+ * the whole frame. Either the complete line is durably on disk (verifiable
+ * via JSON.parse + checksum) or it is torn — there is no intermediate state
+ * where an entry exists without its receipt. A torn tail is the only
+ * corruption a single-process append can produce; it is quarantined with a
+ * typed diagnostic and never treated as a committed message.
+ */
+const JOURNAL_FRAME_VERSION = 1;
+
+interface JournalFrame {
+	__piJournal: 1;
+	v: number;
+	seq: number;
+	entry: SessionTreeEntry;
+	receipt: SessionCommitReceipt;
+	checksum: string;
+}
+
+/**
+ * Frame checksum over the canonical frame payload. Uses the global Web Crypto
+ * API (Node >=19 and browsers) so the harness keeps bundling for browser
+ * platforms (browser-smoke gate), mirroring computeMessageContentHash.
+ */
+export async function computeJournalFrameChecksum(frame: {
+	v: number;
+	seq: number;
+	entry: SessionTreeEntry;
+	receipt: SessionCommitReceipt;
+}): Promise<string> {
+	const data = new TextEncoder().encode(JSON.stringify([frame.v, frame.seq, frame.entry, frame.receipt]));
+	const digest = await crypto.subtle.digest("SHA-256", data);
+	return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+async function encodeJournalFrame(
+	seq: number,
+	entry: SessionTreeEntry,
+	receipt: SessionCommitReceipt,
+): Promise<string> {
+	const frame: JournalFrame = {
+		__piJournal: 1,
+		v: JOURNAL_FRAME_VERSION,
+		seq,
+		entry,
+		receipt,
+		checksum: await computeJournalFrameChecksum({ v: JOURNAL_FRAME_VERSION, seq, entry, receipt }),
+	};
+	return JSON.stringify(frame);
+}
+
+/**
+ * Parse a journal line into a validated frame. Returns undefined when the
+ * line is not a journal frame (entry lines, ack markers, legacy markers).
+ * Throws {@link invalidEntry} for a frame whose checksum does not verify
+ * (bit-rot that still parses as JSON) — callers decide between fail-closed
+ * and quarantine depending on whether the line is the file tail.
+ */
+async function parseJournalFrame(
+	line: string,
+	path: string,
+	lineNumber: number,
+): Promise<{ entry: SessionTreeEntry; receipt: SessionCommitReceipt; seq: number } | undefined> {
+	let value: unknown;
+	try {
+		value = JSON.parse(line);
+	} catch {
+		return undefined;
+	}
+	if (typeof value !== "object" || value === null) return undefined;
+	const record = value as {
+		__piJournal?: unknown;
+		v?: unknown;
+		seq?: unknown;
+		entry?: unknown;
+		receipt?: unknown;
+		checksum?: unknown;
+	};
+	if (record.__piJournal !== 1) return undefined;
+	if (typeof record.v !== "number" || record.v !== JOURNAL_FRAME_VERSION) {
+		throw invalidEntry(path, lineNumber, `unsupported journal frame version ${JSON.stringify(record.v)}`);
+	}
+	if (typeof record.seq !== "number" || !Number.isInteger(record.seq) || record.seq < 1) {
+		throw invalidEntry(path, lineNumber, "journal frame has an invalid seq");
+	}
+	if (
+		typeof record.entry !== "object" ||
+		record.entry === null ||
+		typeof record.receipt !== "object" ||
+		record.receipt === null
+	) {
+		throw invalidEntry(path, lineNumber, "journal frame is missing entry or receipt");
+	}
+	if (typeof record.checksum !== "string" || record.checksum.length !== 64) {
+		throw invalidEntry(path, lineNumber, "journal frame has an invalid checksum");
+	}
+	const frame = record as unknown as JournalFrame;
+	const expected = await computeJournalFrameChecksum({
+		v: frame.v,
+		seq: frame.seq,
+		entry: frame.entry,
+		receipt: frame.receipt,
+	});
+	if (expected !== frame.checksum) {
+		throw invalidEntry(path, lineNumber, "journal frame checksum mismatch (torn or corrupted commit)");
+	}
+	return { entry: frame.entry, receipt: frame.receipt, seq: frame.seq };
+}
+
+interface JsonlSessionLoadResult {
+	metadata: JsonlSessionMetadata;
+	entries: SessionTreeEntry[];
+	/** Pending receipts in commit order, with the journal seq when known. */
+	pendingReceipts: { receipt: SessionCommitReceipt; order: number }[];
+	/** Torn-tail / corruption diagnostics from this load (typed, human-readable). */
+	diagnostics: string[];
+	/**
+	 * Highest journal seq seen in the file, INCLUDING frames whose receipts
+	 * were already acked. Seeding the next-append counter from pending-only
+	 * seqs would reuse a seq after an ack (violating monotonicity).
+	 */
+	maxJournalSeq: number;
 }
 
 function encodeCwd(cwd: string): string {
@@ -231,6 +430,10 @@ export class JsonlSessionBackend {
 	private sessionsRoot: string | undefined;
 	private readonly entryIndexesByPath = new Map<string, ArraySessionIndex>();
 	private readonly operationKeysByPath = new Map<string, string>();
+	/** iris_agent#51: per-path next journal seq (monotonic commit sequence). */
+	private readonly journalSeqsByPath = new Map<string, number>();
+	/** iris_agent#51: torn-tail / corruption diagnostics from the latest load. */
+	private readonly loadDiagnosticsByPath = new Map<string, string[]>();
 	private readonly operations: KeyedOperationQueue<string>;
 	private disposed = false;
 	private disposePromise: Promise<void> | undefined;
@@ -268,6 +471,8 @@ export class JsonlSessionBackend {
 		const entries = this.entryIndexesByPath.get(metadata.path);
 		if (entries) entries.replace(document.entries);
 		else this.entryIndexesByPath.set(metadata.path, new ArraySessionIndex(document.entries));
+		this.loadDiagnosticsByPath.set(metadata.path, document.diagnostics);
+		this.journalSeqsByPath.set(metadata.path, document.maxJournalSeq);
 		return document.metadata;
 	}
 
@@ -427,14 +632,21 @@ export class JsonlSessionBackend {
 			appendEntryWithReceipt: (entry, receipt) => this.appendEntryWithReceipt(metadata, entry, receipt),
 			readPendingCommitReceipts: () => this.readPendingCommitReceipts(metadata),
 			ackCommitReceipt: (entryId) => this.ackCommitReceipt(metadata, entryId),
+			supportsCrashRecoverableReceipts: () => this.supportsCrashRecoverableReceipts(),
+			journalDiagnostics: () => this.journalDiagnostics(metadata),
 		};
 	}
 
 	/**
-	 * Crash-journal append (iris_agent#40 / Feature 2): writes the entry line
-	 * and its pending receipt marker in a single appendFile call so the pair
-	 * is durable together. The marker line carries `__piReceipt` and is skipped
-	 * by loadJsonlSession so it never enters the entry index.
+	 * iris_agent#51 framed journal append. Writes ONE self-describing frame
+	 * line containing the entry, its pending receipt, a monotonic seq and a
+	 * sha256 checksum, then fsyncs the file BEFORE returning — the durable
+	 * append and the recoverable receipt are one verifiable unit. A torn
+	 * write (crash mid-append) can only leave an incomplete LAST line, which
+	 * the loader quarantines; it can never yield a complete entry without its
+	 * receipt. Requires the fsync (`syncFile`) capability; without it the
+	 * backend refuses the journal (fail closed) instead of claiming an
+	 * unsupported durability boundary.
 	 */
 	private appendEntryWithReceipt(
 		metadata: JsonlSessionMetadata,
@@ -448,46 +660,57 @@ export class JsonlSessionBackend {
 			) {
 				throw new SessionError("not_found", `Session not found: ${metadata.path}`);
 			}
+			if (this.fs.syncFile === undefined) {
+				throw new SessionError(
+					"storage",
+					`JSONL commit journal requires fsync (syncFile) capability; crash-recoverable receipts are unsupported on this filesystem (${metadata.path})`,
+				);
+			}
 			let entries = this.entryIndexesByPath.get(metadata.path);
 			if (!entries) {
 				await this.loadDocument(metadata);
 				entries = this.entryIndexesByPath.get(metadata.path)!;
 			}
 			if (entries.has(entry.id)) throw new SessionError("invalid_entry", `Entry ${entry.id} already exists`);
-			const marker = JSON.stringify({ __piReceipt: true, receipt });
+			const seq = (this.journalSeqsByPath.get(metadata.path) ?? 0) + 1;
+			const line = await encodeJournalFrame(seq, entry, receipt);
 			getFileSystemResultOrThrow(
-				await this.fs.appendFile(metadata.path, `${JSON.stringify(entry)}\n${marker}\n`),
+				await this.fs.appendFile(metadata.path, `${line}\n`),
 				`Failed to append session entry ${entry.id}`,
 			);
+			// Durability boundary: the caller must not observe success before
+			// the frame is flushed to stable storage.
+			getFileSystemResultOrThrow(
+				await this.fs.syncFile(metadata.path),
+				`Failed to fsync session ${metadata.path} after journal append`,
+			);
+			this.journalSeqsByPath.set(metadata.path, seq);
 			entries.append(entry);
 		});
 	}
 
-	/** Pending (recorded, not yet acked) receipts in commit order. */
+	/**
+	 * Pending (recorded, not yet acked) receipts in commit order
+	 * (iris_agent#50: authoritative seq order; timestamps are diagnostics).
+	 * Re-reads the file so ack markers appended since the last load are
+	 * reflected; frames are validated structurally and by checksum.
+	 */
 	private async readPendingCommitReceipts(metadata: JsonlSessionMetadata): Promise<readonly SessionCommitReceipt[]> {
 		this.assertOpen();
 		return this.operations.enqueue(this.operationKey(metadata), async () => {
-			const content = getFileSystemResultOrThrow(
-				await this.fs.readTextFile(metadata.path),
-				`Failed to read session ${metadata.path}`,
-			);
-			const pending = new Map<string, SessionCommitReceipt>();
-			for (const line of content.split("\n")) {
-				const trimmed = line.trim();
-				if (!trimmed) continue;
-				if (trimmed.includes('"__piReceipt"')) {
-					const value = JSON.parse(trimmed) as { __piReceipt?: boolean; receipt?: SessionCommitReceipt };
-					if (value.__piReceipt && value.receipt) pending.set(value.receipt.entryId, value.receipt);
-				} else if (trimmed.includes("__piReceiptAck")) {
-					const value = JSON.parse(trimmed) as { __piReceiptAck?: boolean; entryId?: string };
-					if (value.__piReceiptAck && value.entryId) pending.delete(value.entryId);
-				}
-			}
-			return [...pending.values()];
+			const document = await loadJsonlSession(this.fs, metadata.path);
+			this.loadDiagnosticsByPath.set(metadata.path, document.diagnostics);
+			this.journalSeqsByPath.set(metadata.path, document.maxJournalSeq);
+			return [...document.pendingReceipts].sort((a, b) => a.order - b.order).map((pending) => pending.receipt);
 		});
 	}
 
-	/** Appends an append-only ack marker; replay skips acked entry ids. */
+	/**
+	 * Appends an append-only ack marker; replay skips acked entry ids. The
+	 * marker is intentionally NOT fsynced: losing a torn ack tail only
+	 * re-replays an already-published receipt (idempotent for consumers), it
+	 * never fabricates a duplicate commit.
+	 */
 	private ackCommitReceipt(metadata: JsonlSessionMetadata, entryId: string): Promise<void> {
 		this.assertOpen();
 		return this.operations.enqueue(this.operationKey(metadata), async () => {
@@ -502,6 +725,19 @@ export class JsonlSessionBackend {
 				`Failed to acknowledge receipt for entry ${entryId}`,
 			);
 		});
+	}
+
+	/**
+	 * iris_agent#51 explicit durability capability: crash-recoverable receipts
+	 * are supported exactly when the filesystem can fsync.
+	 */
+	supportsCrashRecoverableReceipts(): boolean {
+		return this.fs.syncFile !== undefined;
+	}
+
+	/** Diagnostics from the most recent load of this session file. */
+	journalDiagnostics(metadata: JsonlSessionMetadata): readonly string[] {
+		return [...(this.loadDiagnosticsByPath.get(metadata.path) ?? [])];
 	}
 
 	private entryIndex(path: string): ArraySessionIndex {

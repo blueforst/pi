@@ -7,6 +7,7 @@ import {
 	lstat,
 	mkdir,
 	mkdtemp,
+	open,
 	readdir,
 	readFile,
 	realpath,
@@ -573,6 +574,27 @@ export class NodeExecutionEnv implements ExecutionEnv {
 		try {
 			await mkdir(resolve(resolved, ".."), { recursive: true });
 			await appendFile(resolved, content);
+			return ok(undefined);
+		} catch (error) {
+			return err(toFileError(error, resolved));
+		}
+	}
+
+	/**
+	 * Explicit durability boundary (iris_agent#51): fsync the file so the
+	 * append is flushed to stable storage before the caller reports success.
+	 * `r+` never truncates; fsync on a read-write handle flushes the file
+	 * data (metadata durability is implied by the filesystem contract).
+	 */
+	async syncFile(path: string): Promise<Result<void, FileError>> {
+		const resolved = resolvePath(this.cwd, path);
+		try {
+			const handle = await open(resolved, "r+");
+			try {
+				await handle.sync();
+			} finally {
+				await handle.close();
+			}
 			return ok(undefined);
 		} catch (error) {
 			return err(toFileError(error, resolved));

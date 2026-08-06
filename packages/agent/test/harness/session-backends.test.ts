@@ -151,7 +151,21 @@ describe("JsonlSessionBackend", () => {
 		await expect(repo.open(metadata)).rejects.toMatchObject({ code: "invalid_session" });
 
 		const header = { type: "session", version: 3, id: "session-1", timestamp: metadata.createdAt, cwd: root };
+		// A malformed LAST line is a torn tail (iris_agent#51): quarantined with
+		// a typed diagnostic, not a fatal invalid_entry — an interrupted append
+		// must not make the whole session unreadable. Mid-file corruption below
+		// still fails closed.
 		writeFileSync(metadata.path, `${JSON.stringify(header)}\nnot json\n`);
+		const reopened = await repo.open(metadata);
+		expect((await reopened.getEntries()).length).toBe(0);
+		expect(await reopened.journalDiagnostics()).toEqual([
+			"torn_tail: line 2: line is not valid JSON (Unexpected token 'o', \"not json\" is not valid JSON); quarantined",
+		]);
+		// Mid-file corruption stays fail-closed.
+		writeFileSync(
+			metadata.path,
+			`${JSON.stringify(header)}\nnot json\n${JSON.stringify({ type: "message", id: "e2", parentId: null, timestamp: metadata.createdAt, message: createUserMessage("x") })}\n`,
+		);
 		await expect(repo.open(metadata)).rejects.toMatchObject({ code: "invalid_entry" });
 	});
 

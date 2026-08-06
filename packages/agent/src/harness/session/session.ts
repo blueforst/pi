@@ -275,7 +275,15 @@ export class Session<TMetadata extends SessionMetadata = SessionMetadata> {
 				timestamp: new Date().toISOString(),
 			});
 			const receipt = createReceipt(entry);
-			if (this.storage.appendEntryWithReceipt) {
+			// iris_agent#51: the journal is only used when the backend both
+			// implements it AND explicitly supports crash-recoverable receipts
+			// (e.g. JSONL requires an fsync/syncFile capability). Otherwise fall
+			// back to the plain append (receipts are publish-only, not durable)
+			// rather than pretending an unsupported durability boundary exists.
+			if (
+				this.storage.appendEntryWithReceipt !== undefined &&
+				this.storage.supportsCrashRecoverableReceipts?.() !== false
+			) {
 				await this.storage.appendEntryWithReceipt(entry, receipt);
 			} else {
 				await this.storage.appendEntry(entry);
@@ -321,6 +329,25 @@ export class Session<TMetadata extends SessionMetadata = SessionMetadata> {
 	/** Marks a commit receipt as published; crash recovery skips it afterwards. */
 	async ackCommitReceipt(entryId: string): Promise<void> {
 		await this.storage.ackCommitReceipt?.(entryId);
+	}
+
+	/**
+	 * iris_agent#51: whether this Session's storage draws an explicit
+	 * durability boundary for entry+receipt journal commits (SQLite
+	 * transaction, memory ordering, framed JSONL with fsync). Production
+	 * configurations that require crash recovery must check this and fail
+	 * closed when false.
+	 */
+	supportsCrashRecoverableReceipts(): boolean {
+		return (
+			this.storage.appendEntryWithReceipt !== undefined &&
+			this.storage.supportsCrashRecoverableReceipts?.() !== false
+		);
+	}
+
+	/** Diagnostics from the most recent load (torn tails, checksum failures). */
+	async journalDiagnostics(): Promise<readonly string[]> {
+		return [...((await this.storage.journalDiagnostics?.()) ?? [])];
 	}
 
 	private async setLeafId(leafId: string | null): Promise<LeafEntry> {
