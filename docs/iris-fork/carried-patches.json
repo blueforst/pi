@@ -9,8 +9,14 @@
 			"firstForkCommit": "310e73313cd836cde4014085577a3e46a757192c",
 			"latestForkCommit": "e65e26bd2893895941ecf130e6c5a731b43e2b4b",
 			"genericRuntimeRationale": "Any agent runtime consumer needs to decide systemPrompt/messages/tools completely before provider conversion without forcing Session.buildContext() (e.g. identity-level Context engines that do not derive messages from the Session archive). The default native Session-derived path is unchanged and byte-compatible when the controller is absent.",
-			"affectedPackages": ["@earendil-works/pi-agent-core"],
-			"affectedSurfaces": ["AgentHarness options", "createTurnState", "provider request composition"],
+			"affectedPackages": [
+				"@earendil-works/pi-agent-core"
+			],
+			"affectedSurfaces": [
+				"AgentHarness options",
+				"createTurnState",
+				"provider request composition"
+			],
 			"tests": [
 				"packages/agent/test/harness/runtime-seams.test.ts (PI-015 controller path skips buildContext; provider receives controller systemPrompt/messages)",
 				"packages/agent/test/harness/runtime-seams.test.ts (PI-015 default path still calls buildContext and stays compatible)"
@@ -31,8 +37,15 @@
 			"firstForkCommit": "310e73313cd836cde4014085577a3e46a757192c",
 			"latestForkCommit": "e209e56163fac2992e8aaf0fbcd67cb4fb663c84",
 			"genericRuntimeRationale": "Consumers of the Session archive need awaited, durable commit evidence (sessionId, entryId, content hash, optional entrySeq) to attribute messages exactly once and to reconcile crash windows; observer-only events cannot prove durability. Receipts are carried on the new message_finalized lifecycle event; the Session append API itself keeps its existing return contract. iris_agent#40 consolidates every supported append path (agent loop, direct appendMessage, pending-writes flush) onto one shared appendAndCommitMessage primitive so no valid durable append can bypass commit evidence.",
-			"affectedPackages": ["@earendil-works/pi-agent-core"],
-			"affectedSurfaces": ["SessionCommitReceipt type", "message_finalized OwnEvent", "content hash computation", "appendAndCommitMessage shared commit primitive"],
+			"affectedPackages": [
+				"@earendil-works/pi-agent-core"
+			],
+			"affectedSurfaces": [
+				"SessionCommitReceipt type",
+				"message_finalized OwnEvent",
+				"content hash computation",
+				"appendAndCommitMessage shared commit primitive"
+			],
 			"tests": [
 				"packages/agent/test/harness/runtime-seams.test.ts (message_finalized carries a full receipt for every appended message)",
 				"packages/agent/test/harness/runtime-seams.test.ts (deterministic content hash via exported computeMessageContentHash)",
@@ -57,8 +70,14 @@
 			"firstForkCommit": "310e73313cd836cde4014085577a3e46a757192c",
 			"latestForkCommit": "e65e26bd2893895941ecf130e6c5a731b43e2b4b",
 			"genericRuntimeRationale": "A generic agent runtime needs stable lifecycle events distinguishing message finalization, tool execution commit and turn commit from observer-level stream updates, so consumers can order user/tool/assistant boundaries and prove exactly-once attribution without scanning the Session archive.",
-			"affectedPackages": ["@earendil-works/pi-agent-core"],
-			"affectedSurfaces": ["AgentHarnessOwnEvent union", "handleAgentEvent", "afterToolCall"],
+			"affectedPackages": [
+				"@earendil-works/pi-agent-core"
+			],
+			"affectedSurfaces": [
+				"AgentHarnessOwnEvent union",
+				"handleAgentEvent",
+				"afterToolCall"
+			],
 			"tests": [
 				"packages/agent/test/harness/runtime-seams.test.ts (message_finalized per appended message)",
 				"packages/agent/test/harness/runtime-seams.test.ts (turn_committed and settled in stable order)",
@@ -72,6 +91,39 @@
 			"removalCondition": "earendil-works/pi emits equivalent lifecycle events and iris_agent consumes the released contract.",
 			"compatibilityRisk": "low: additive events only; no existing event payload is changed.",
 			"notes": "settled/save_point/abort events already existed and are reused; the new events add the missing commit granularity."
+		},
+		{
+			"id": "PI-018-hermetic-model-catalog",
+			"title": "Hermetic, content-addressed model catalog generation",
+			"status": "proposed",
+			"genericRuntimeRationale": "Any runtime consumer that needs reproducible builds and typed model catalogs (e.g. identity-level Context engines that pin the accepted runtime) must not have normal build/check/test depend on mutable third-party model catalogs (models.dev, NVIDIA NIM, OpenRouter, Vercel AI Gateway). The fork commits the content-addressed model snapshot (per-file sha256 + structureHash + source provenance) and regenerates TypeScript shards/aggregator offline from it; live refresh is an explicit, separately reviewed command. Tests no longer reference transient catalog member IDs.",
+			"affectedPackages": [
+				"@earendil-works/pi-ai"
+			],
+			"affectedSurfaces": [
+				"npm run build / build:offline (packages/ai)",
+				"scripts/generate-models.ts (--from-data / --check-only)",
+				"src/providers/data/*.json + .manifest.json committed snapshot",
+				"check:model-data / check:model-consistency gates",
+				"packages/ai/test/abort.test.ts + test/fixtures.ts"
+			],
+			"tests": [
+				"scripts/model-catalog-hermetic.test.mjs (offline --from-data regeneration is stable and hermetic)",
+				"scripts/model-catalog-hermetic.test.mjs (consistency gate fails on shard out-of-sync)",
+				"scripts/model-catalog-hermetic.test.mjs (catalog drift / stale snapshot / checksum mismatch)",
+				"scripts/model-catalog-hermetic.test.mjs (single-upstream and all-upstream failure fail fast)",
+				"packages/ai/test/model-data-validation.test.ts (manifest sources metadata)",
+				"packages/ai/test/abort.test.ts (fixture models instead of transient catalog IDs)",
+				"packages/ai/test/anthropic-adaptive-thinking-models.test.ts (snapshot-derived expectations)"
+			],
+			"upstream": {
+				"status": "not_filed",
+				"issue": null,
+				"pullRequest": null
+			},
+			"removalCondition": "earendil-works/pi ships a hermetic, content-addressed model catalog generation path (or drops live-fetch generation from the normal build) with equivalent reproducibility gates.",
+			"compatibilityRisk": "low: normal build output is byte-identical to the committed snapshot; live refresh remains available as an explicit command.",
+			"notes": "Models snapshot generated 2026-08-06 from live upstreams with sources[] provenance in .manifest.json. PI_*_URL environment variables allow failure-matrix testing; refresh path honors HTTPS_PROXY via undici ProxyAgent. Status proposed because acceptedRuntime has not advanced past this change yet; promotion to carried happens with the accepted-runtime advancement (iris_agent#41 / Feature 3)."
 		}
 	]
 }
