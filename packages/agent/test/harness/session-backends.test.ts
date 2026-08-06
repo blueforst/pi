@@ -297,4 +297,66 @@ describe("JSONL crash-consistent commit journal (iris_agent#40 Feature 2)", () =
 		expect(entries[0]!.type).toBe("message");
 		await reopenedRepo[Symbol.asyncDispose]();
 	});
+
+	it("does not mistake entry text containing journal marker strings for marker lines", async () => {
+		const root = createTempDir();
+		const env = new NodeExecutionEnv({ cwd: root });
+		const repo = new JsonlSessionRepository({ fs: env, sessionsRoot: root });
+		const session = await repo.create({ cwd: root, id: "session-marker-fp" });
+		const metadata = await session.getMetadata();
+
+		// Plain append path (no journal): the message text contains both marker
+		// strings. A substring-based marker filter would drop this entry on
+		// reload; the structural check must keep it.
+		const entryId = await session.appendMessage(
+			createUserMessage("please log __piReceiptAck and __piReceipt in the output"),
+		);
+		await repo[Symbol.asyncDispose]();
+
+		const reopenedRepo = new JsonlSessionRepository({ fs: env, sessionsRoot: root });
+		const reopened = await reopenedRepo.open(metadata);
+		const entries = await reopened.getEntries();
+		expect(entries.length).toBe(1);
+		expect(entries[0]!.id).toBe(entryId);
+		expect(entries[0]!.type).toBe("message");
+		await reopenedRepo[Symbol.asyncDispose]();
+	});
+
+	it("crash recovery does not deadlock when the pending receipt message text contains marker strings", async () => {
+		const root = createTempDir();
+		const env = new NodeExecutionEnv({ cwd: root });
+		const repo = new JsonlSessionRepository({ fs: env, sessionsRoot: root });
+		const session = await repo.create({ cwd: root, id: "session-marker-fp-recovery" });
+		const metadata = await session.getMetadata();
+
+		// Journal path with marker-looking text in the message.
+		const message = createUserMessage("mention __piReceiptAck inside the committed message");
+		const contentHash = await computeMessageContentHash(message);
+		await session.appendMessageWithCommitReceipt(message, (entryId) => ({
+			sessionId: metadata.id,
+			entryId,
+			contentHash,
+			committedAt: new Date().toISOString(),
+		}));
+		await repo[Symbol.asyncDispose]();
+
+		// Reopen: entry must survive and recovery must replay, not throw.
+		const reopenedRepo = new JsonlSessionRepository({ fs: env, sessionsRoot: root });
+		const reopened = await reopenedRepo.open(metadata);
+		expect((await reopened.getEntries()).length).toBe(1);
+
+		const finalized: MessageFinalizedEvent[] = [];
+		const harness = new AgentHarness({
+			models,
+			session: reopened,
+			model: newFaux().getModel(),
+			systemPrompt: "You are helpful.",
+		});
+		harness.subscribe((event) => {
+			if (event.type === "message_finalized") finalized.push(event as MessageFinalizedEvent);
+		});
+		expect(await harness.recoverPendingCommitReceipts()).toBe(1);
+		expect(finalized.length).toBe(1);
+		await reopenedRepo[Symbol.asyncDispose]();
+	});
 });

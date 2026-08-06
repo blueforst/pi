@@ -189,7 +189,17 @@ async function loadJsonlSession(fs: JsonlSessionFileSystem, path: string): Promi
 
 /** True for crash-journal marker lines appended by appendEntryWithReceipt/ackCommitReceipt. */
 function isReceiptJournalLine(line: string): boolean {
-	return line.includes('"__piReceipt"') || line.includes("__piReceiptAck");
+	let value: unknown;
+	try {
+		value = JSON.parse(line);
+	} catch {
+		return false;
+	}
+	if (typeof value !== "object" || value === null) return false;
+	const record = value as { __piReceipt?: unknown; __piReceiptAck?: unknown };
+	// Structural check, not substring matching: a legitimate entry whose message
+	// text merely contains "__piReceiptAck" must never be mistaken for a marker.
+	return record.__piReceipt === true || record.__piReceiptAck === true;
 }
 
 function encodeCwd(cwd: string): string {
