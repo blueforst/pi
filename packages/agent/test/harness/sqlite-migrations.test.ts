@@ -6,6 +6,7 @@ import {
 	applyMigrations,
 	createNodeSqliteFactory,
 	loadMigrations,
+	releasedMigrationChecksums,
 	type SqliteDatabase,
 	type SqliteDatabaseFactory,
 	type SqliteRunResult,
@@ -238,7 +239,11 @@ describe("SQLite migrations", () => {
 				.prepare(
 					"SELECT entry_id, receipt_seq, quarantine_reason FROM session_commit_receipts ORDER BY receipt_seq",
 				)
-				.all<{ entry_id: string; receipt_seq: number; quarantine_reason: string | null }>();
+				.all<{
+					entry_id: string;
+					receipt_seq: number;
+					quarantine_reason: string | null;
+				}>();
 			expect(rows.map((row) => row.entry_id)).toEqual(["e1", "e2", "e3"]);
 			expect(rows.map((row) => row.receipt_seq)).toEqual([1, 2, 3]);
 			expect(rows.every((row) => row.quarantine_reason === null)).toBe(true);
@@ -266,11 +271,124 @@ describe("SQLite migrations", () => {
 		}
 	});
 
+	it("iris_agent#67: every released migration has a manifest checksum matching the packaged SQL (release-owned gate)", async () => {
+		const manifest = releasedMigrationChecksums();
+		const migrations = await loadMigrations();
+		// Every packaged migration must be pinned in the release manifest.
+		expect(Object.keys(manifest).sort()).toEqual(migrations.map((m) => m.id).sort());
+		// The pinned checksums must equal the sha256 of the packaged SQL — if a
+		// released migration file is edited without updating the manifest, this
+		// fails closed at the source.
+		for (const migration of migrations) {
+			expect(manifest[migration.id], migration.id).toBe(
+				require("node:crypto").createHash("sha256").update(migration.sql).digest("hex"),
+			);
+		}
+	});
+
+	it("iris_agent#67: a legacy DB with empty checksum rows backfills ONLY against the release-owned manifest", async () => {
+		const root = createTempDir();
+		const databasePath = join(root, "sessions.sqlite");
+		const sqlite = createNodeSqliteFactory();
+		const db = await sqlite.open(databasePath);
+		try {
+			// Pre-checksum era: migrations table without a checksum column,
+			// every released migration already applied.
+			await db.exec("CREATE TABLE migrations (id TEXT PRIMARY KEY, applied_at TEXT NOT NULL)");
+			const migrations = await loadMigrations();
+			for (const migration of migrations) {
+				await db.exec(migration.sql);
+				await db
+					.prepare("INSERT INTO migrations (id, applied_at) VALUES (?, ?)")
+					.run(migration.id, new Date().toISOString());
+			}
+			// First checksum-enabled upgrade: empty rows backfill to the
+			// release-owned pinned checksums, not to a self-blessed hash.
+			await applyMigrations(db);
+			const rows = await db
+				.prepare("SELECT id, checksum FROM migrations ORDER BY id")
+				.all<{ id: string; checksum: string }>();
+			const manifest = releasedMigrationChecksums();
+			for (const row of rows) {
+				expect(row.checksum, row.id).toBe(manifest[row.id]);
+			}
+		} finally {
+			await db.close();
+		}
+	});
+
+	it("iris_agent#67: an edited legacy migration fails closed before the first checksum backfill (no self-blessing)", async () => {
+		const root = createTempDir();
+		const databasePath = join(root, "sessions.sqlite");
+		const sqlite = createNodeSqliteFactory();
+		const db = await sqlite.open(databasePath);
+		try {
+			// Pre-checksum era DB with 001-003 applied (the 003-era shape).
+			await db.exec("CREATE TABLE migrations (id TEXT PRIMARY KEY, applied_at TEXT NOT NULL)");
+			for (const id of ["001_initial.sql", "002_branch_tips.sql", "003_commit_receipts.sql"]) {
+				const migration = (await loadMigrations()).find((m) => m.id === id);
+				if (!migration) throw new Error(`Missing ${id}`);
+				await db.exec(migration.sql);
+				await db
+					.prepare("INSERT INTO migrations (id, applied_at) VALUES (?, ?)")
+					.run(migration.id, new Date().toISOString());
+			}
+			// The packaged 003 SQL is EDITED before the first checksum-enabled
+			// upgrade (e.g. an operator touched the released file). The old code
+			// blessed the current file's hash; the fix must fail closed because
+			// it does not match the release-owned manifest.
+			const edited = (await loadMigrations()).map((m) =>
+				m.id === "003_commit_receipts.sql" ? { ...m, sql: `${m.sql}\n-- edited in place\n` } : m,
+			);
+			await expect(applyMigrations(db, { migrations: edited })).rejects.toThrow(/manifest checksum|fail closed/);
+			// The empty checksum row was NOT backfilled (no silent blessing).
+			const row = await db
+				.prepare("SELECT checksum FROM migrations WHERE id = ?")
+				.get<{ checksum: string }>("003_commit_receipts.sql");
+			expect(row?.checksum).toBe("");
+		} finally {
+			await db.close();
+		}
+	});
+
+	it("iris_agent#67: an unknown applied migration id fails closed instead of being silently ignored", async () => {
+		const root = createTempDir();
+		const databasePath = join(root, "sessions.sqlite");
+		const sqlite = createNodeSqliteFactory();
+		const db = await sqlite.open(databasePath);
+		try {
+			// Pre-checksum era DB where a NEWER unknown migration id is already
+			// recorded (schema from a newer release than this checkout).
+			await db.exec("CREATE TABLE migrations (id TEXT PRIMARY KEY, applied_at TEXT NOT NULL)");
+			const migrations = await loadMigrations();
+			for (const migration of migrations) {
+				await db.exec(migration.sql);
+				await db
+					.prepare("INSERT INTO migrations (id, applied_at) VALUES (?, ?)")
+					.run(migration.id, new Date().toISOString());
+			}
+			await db
+				.prepare("INSERT INTO migrations (id, applied_at) VALUES (?, ?)")
+				.run("999_unknown_future.sql", new Date().toISOString());
+			// The unknown id is not part of this release's packaged migrations —
+			// the runner must fail closed instead of proceeding against a schema
+			// that may be newer than the checkout.
+			await expect(applyMigrations(db)).rejects.toThrow(/999_unknown_future.sql/);
+			await expect(applyMigrations(db)).rejects.toThrow(/fail closed/);
+		} finally {
+			await db.close();
+		}
+	});
+
 	it("persists session metadata through create, list, open, and fork", async () => {
 		const root = createTempDir();
 		const databasePath = join(root, "sessions.sqlite");
 		const env = new NodeExecutionEnv({ cwd: root });
-		const repo = new SqliteSessionRepository({ env, sqlite: createNodeSqliteFactory(), databasePath });
+		const repo = new SqliteSessionRepository({
+			env,
+			sqlite: createNodeSqliteFactory(),
+			databasePath,
+		});
 		const source = await repo.create({
 			cwd: root,
 			id: "session-1",
@@ -280,14 +398,21 @@ describe("SQLite migrations", () => {
 		expect(sourceMetadata.metadata).toEqual({ profile: "reviewer" });
 		expect((await repo.list({ cwd: root })).map((listed) => listed.metadata)).toEqual([{ profile: "reviewer" }]);
 		expect((await (await repo.open(sourceMetadata)).getMetadata()).metadata).toEqual({ profile: "reviewer" });
-		const fork = await repo.fork(sourceMetadata, { cwd: root, id: "session-2" });
-		expect((await fork.getMetadata()).metadata).toEqual({ profile: "reviewer" });
+		const fork = await repo.fork(sourceMetadata, {
+			cwd: root,
+			id: "session-2",
+		});
+		expect((await fork.getMetadata()).metadata).toEqual({
+			profile: "reviewer",
+		});
 		const overridden = await repo.fork(sourceMetadata, {
 			cwd: root,
 			id: "session-3",
 			metadata: { profile: "writer" },
 		});
-		expect((await overridden.getMetadata()).metadata).toEqual({ profile: "writer" });
+		expect((await overridden.getMetadata()).metadata).toEqual({
+			profile: "writer",
+		});
 	});
 
 	it("rolls back the entire fork when copying an entry fails", async () => {
@@ -408,7 +533,11 @@ END;
 		const root = createTempDir();
 		const databasePath = join(root, "sessions.sqlite");
 		const env = new NodeExecutionEnv({ cwd: root });
-		const repo = new SqliteSessionRepository({ env, sqlite: createNodeSqliteFactory(), databasePath });
+		const repo = new SqliteSessionRepository({
+			env,
+			sqlite: createNodeSqliteFactory(),
+			databasePath,
+		});
 		const session = await repo.create({ cwd: root, id: "session-1" });
 		const rootId = await session.appendMessage(createUserMessage("root"));
 		await session.appendMessage(createAssistantMessage("first child"));
@@ -428,7 +557,11 @@ END;
 		const root = createTempDir();
 		const databasePath = join(root, "sessions.sqlite");
 		const env = new NodeExecutionEnv({ cwd: root });
-		const repo = new SqliteSessionRepository({ env, sqlite: createNodeSqliteFactory(), databasePath });
+		const repo = new SqliteSessionRepository({
+			env,
+			sqlite: createNodeSqliteFactory(),
+			databasePath,
+		});
 		const session = await repo.create({ cwd: root, id: "session-1" });
 		const ids = [
 			await session.appendMessage(createUserMessage("one")),
@@ -454,7 +587,11 @@ END;
 			open: async () => db,
 		};
 		const env = new NodeExecutionEnv({ cwd: root });
-		const repo = new SqliteSessionRepository({ env, sqlite, databasePath: join(root, "sessions.sqlite") });
+		const repo = new SqliteSessionRepository({
+			env,
+			sqlite,
+			databasePath: join(root, "sessions.sqlite"),
+		});
 
 		await expect(repo.create({ cwd: root, id: "session-1" })).rejects.toThrow("insert failed");
 		expect(db.closeCount).toBe(0);
@@ -474,7 +611,11 @@ END;
 			open: async () => db,
 		};
 		const env = new NodeExecutionEnv({ cwd: root });
-		const repo = new SqliteSessionRepository({ env, sqlite, databasePath: join(root, "sessions.sqlite") });
+		const repo = new SqliteSessionRepository({
+			env,
+			sqlite,
+			databasePath: join(root, "sessions.sqlite"),
+		});
 		const metadata: SqliteSessionMetadata = {
 			id: "missing",
 			createdAt: new Date().toISOString(),
@@ -514,7 +655,10 @@ END;
 		const repo = new SqliteSessionRepository({ env, sqlite, databasePath });
 		const source = await repo.create({ cwd: root, id: "session-1" });
 
-		const fork = await repo.fork(await source.getMetadata(), { cwd: root, id: "session-2" });
+		const fork = await repo.fork(await source.getMetadata(), {
+			cwd: root,
+			id: "session-2",
+		});
 		await fork.appendMessage(createUserMessage("fork"));
 		expect(counts).toEqual({ opens: 1, closes: 0 });
 		await repo[Symbol.asyncDispose]();
@@ -563,7 +707,9 @@ END;
 		}
 
 		const reopened = await repo.open(metadata);
-		await expect(reopened.getEntries()).rejects.toMatchObject({ code: "invalid_entry" });
+		await expect(reopened.getEntries()).rejects.toMatchObject({
+			code: "invalid_entry",
+		});
 	});
 
 	it("does not publish connection state when an append transaction fails", async () => {
@@ -592,7 +738,9 @@ END;
 			message: createUserMessage("root"),
 		};
 		try {
-			await expect(storage.appendEntry(rootEntry)).rejects.toMatchObject({ code: "storage" });
+			await expect(storage.appendEntry(rootEntry)).rejects.toMatchObject({
+				code: "storage",
+			});
 		} finally {
 			await db.exec("DROP TRIGGER fail_branch_tip_insert");
 		}
@@ -636,7 +784,13 @@ END;
 				cacheRead: 40,
 				cacheWrite: 10,
 				totalTokens: 175,
-				cost: { input: 0.1, output: 0.2, cacheRead: 0.03, cacheWrite: 0.04, total: 0.37 },
+				cost: {
+					input: 0.1,
+					output: 0.2,
+					cacheRead: 0.03,
+					cacheWrite: 0.04,
+					total: 0.37,
+				},
 			},
 		};
 		await session.appendMessage(assistant);
@@ -646,7 +800,13 @@ END;
 			cacheRead: 3,
 			cacheWrite: 4,
 			totalTokens: 10,
-			cost: { input: 0.01, output: 0.02, cacheRead: 0.03, cacheWrite: 0.04, total: 0.1 },
+			cost: {
+				input: 0.01,
+				output: 0.02,
+				cacheRead: 0.03,
+				cacheWrite: 0.04,
+				total: 0.1,
+			},
 		});
 		await session.moveTo(userId, {
 			summary: "branch summary",
@@ -656,7 +816,13 @@ END;
 				cacheRead: 7,
 				cacheWrite: 8,
 				totalTokens: 26,
-				cost: { input: 0.05, output: 0.06, cacheRead: 0.07, cacheWrite: 0.08, total: 0.26 },
+				cost: {
+					input: 0.05,
+					output: 0.06,
+					cacheRead: 0.07,
+					cacheWrite: 0.08,
+					total: 0.26,
+				},
 			},
 		});
 		await session.appendSessionName("  My Session  ");
