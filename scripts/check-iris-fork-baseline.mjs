@@ -8,7 +8,8 @@
 //   node scripts/check-iris-fork-baseline.mjs [productionLockPath] [carriedPatchesPath]
 // Defaults to the repo's docs/iris-fork/ manifests.
 
-import { readFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { readFileSync, readdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { spawnSync } from "node:child_process";
@@ -16,6 +17,20 @@ import { spawnSync } from "node:child_process";
 const SCRIPTS_DIR = dirname(fileURLToPath(import.meta.url));
 const DEFAULT_LOCK_PATH = join(SCRIPTS_DIR, "..", "docs", "iris-fork", "production-lock.json");
 const DEFAULT_PATCHES_PATH = join(SCRIPTS_DIR, "..", "docs", "iris-fork", "carried-patches.json");
+const DEFAULT_MIGRATION_MANIFEST_PATH = join(
+	SCRIPTS_DIR,
+	"..",
+	"packages",
+	"storage",
+	"sqlite-node",
+	"src",
+	"sqlite",
+	"migrations",
+	"release-manifest.json",
+);
+const DEFAULT_MIGRATIONS_DIR = join(SCRIPTS_DIR, "..", "packages", "storage", "sqlite-node", "src", "sqlite", "migrations");
+const MIGRATION_MANIFEST_SCHEMA_VERSION = 1;
+const MIGRATION_SHA256_PATTERN = /^[0-9a-f]{64}$/;
 
 export const SUPPORTED_SCHEMA_VERSION = 2;
 
@@ -414,6 +429,103 @@ export function validateAcceptedRuntimeInGit(lock, repoDir, { verifyPatches = fa
 	return errors;
 }
 
+// Migration release manifest (iris_agent#67/#78): the release-owned checksum
+// trust root for the SQLite migration set. It is the SINGLE source shared
+// with the runtime (`packages/storage/sqlite-node/src/sqlite/migrations.ts`),
+// this provenance gate and CI. The manifest array order IS the release order.
+// Any mismatch between the manifest and the packaged migration files fails
+// closed here so a release can never silently self-heal from mutable SQL.
+export function validateReleaseManifest(manifest, label = "release-manifest.json") {
+	const errors = [];
+	if (!isObject(manifest)) {
+		errors.push(`${label}: expected a JSON object, got ${JSON.stringify(manifest)}`);
+		return errors;
+	}
+	if (manifest.schemaVersion !== MIGRATION_MANIFEST_SCHEMA_VERSION) {
+		errors.push(
+			`${label}: schemaVersion: unsupported value ${JSON.stringify(manifest.schemaVersion)}, expected ${MIGRATION_MANIFEST_SCHEMA_VERSION}`
+		);
+	}
+	if (!Array.isArray(manifest.migrations)) {
+		errors.push(`${label}: migrations: expected an array, got ${JSON.stringify(manifest.migrations)}`);
+		return errors;
+	}
+	const seenIds = new Set();
+	for (let index = 0; index < manifest.migrations.length; index++) {
+		const entry = manifest.migrations[index];
+		const entryLabel = `${label}: migrations[${index}]`;
+		if (!isObject(entry)) {
+			errors.push(`${entryLabel}: expected a migration object, got ${JSON.stringify(entry)}`);
+			continue;
+		}
+		checkNonEmptyStringField(entry, "id", entryLabel).forEach((e) => errors.push(e));
+		const sha256 = getPath(entry, "sha256");
+		if (typeof sha256 !== "string" || !MIGRATION_SHA256_PATTERN.test(sha256)) {
+			errors.push(
+				`${entryLabel}: sha256: expected a 64-character lowercase hex sha256, got ${JSON.stringify(sha256)}`
+			);
+		}
+		if (isNonEmptyString(entry.id)) {
+			if (seenIds.has(entry.id)) {
+				errors.push(`${entryLabel}: id: duplicate migration id: ${JSON.stringify(entry.id)}`);
+			}
+			seenIds.add(entry.id);
+		}
+	}
+	return errors;
+}
+
+export function checkMigrationReleaseManifest(
+	manifestPath = DEFAULT_MIGRATION_MANIFEST_PATH,
+	migrationsDir = DEFAULT_MIGRATIONS_DIR
+) {
+	const errors = [];
+	let manifest;
+	try {
+		manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+	} catch (error) {
+		return { ok: false, errors: [`${manifestPath}: cannot read or parse: ${error.message}`] };
+	}
+	errors.push(...validateReleaseManifest(manifest, manifestPath));
+	if (!Array.isArray(manifest.migrations)) {
+		return { ok: false, errors };
+	}
+	let files;
+	try {
+		files = readdirSync(migrationsDir)
+			.filter((name) => name.endsWith(".sql"))
+			.sort();
+	} catch (error) {
+		return { ok: false, errors: [`${migrationsDir}: cannot list packaged migration files: ${error.message}`] };
+	}
+	const manifestIds = manifest.migrations.map((entry) => entry.id);
+	if (manifestIds.join("\u0000") !== files.join("\u0000")) {
+		errors.push(
+			`${manifestPath}: packaged migration files do not match the manifest entries: manifest lists ` +
+				`[${manifestIds.join(", ")}], package ships [${files.join(", ")}]`
+		);
+	}
+	const checksumsById = new Map(manifest.migrations.map((entry) => [entry.id, entry.sha256]));
+	for (const file of files) {
+		const expected = checksumsById.get(file);
+		if (expected === undefined) continue; // set mismatch already reported
+		let digest;
+		try {
+			digest = createHash("sha256").update(readFileSync(join(migrationsDir, file))).digest("hex");
+		} catch (error) {
+			errors.push(`${migrationsDir}/${file}: cannot read packaged migration: ${error.message}`);
+			continue;
+		}
+		if (digest !== expected) {
+			errors.push(
+				`${manifestPath}: packaged migration ${file} sha256 ${digest} does not match its release-owned ` +
+					`manifest checksum ${expected}`
+			);
+		}
+	}
+	return { ok: errors.length === 0, errors };
+}
+
 export function checkIrisForkBaseline(lockPath, patchesPath) {
 	const lockLabel = lockPath;
 	const patchesLabel = patchesPath;
@@ -433,6 +545,7 @@ export function checkIrisForkBaseline(lockPath, patchesPath) {
 		...validateProductionLock(lock, lockLabel),
 		...validateCarriedPatches(patchesDoc, patchesLabel),
 		...validateBaselineConsistency(lock, patchesDoc, lockLabel, patchesLabel),
+		...checkMigrationReleaseManifest().errors,
 	];
 	return { ok: errors.length === 0, errors };
 }

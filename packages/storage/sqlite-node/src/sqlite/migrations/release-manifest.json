@@ -1,0 +1,10 @@
+{
+	"schemaVersion": 1,
+	"migrations": [
+		{ "id": "001_initial.sql", "sha256": "1403e1773e891adddb6099d7db41290e645cb337dbccae23724fb67f3ceafece" },
+		{ "id": "002_branch_tips.sql", "sha256": "a1e284e7ab152c452ffbcd4764cbb2e88f9e041f17aa4f483e67c7d1705a4f5f" },
+		{ "id": "003_commit_receipts.sql", "sha256": "1353d95756dc8fbd246fb14e12bc68f0cb01eb1b8b7957f87738bd586f328777" },
+		{ "id": "004_receipt_seq.sql", "sha256": "fc9629fed3ae827e33bbca7bd4047fba132cd0ddc765e2f6297d5cfc1d35f1c2" },
+		{ "id": "005_quarantine.sql", "sha256": "04317c1b502d3c730bd76c01768f8c89c1b3c872575a325fe71ac16e7d55870f" }
+	]
+}
