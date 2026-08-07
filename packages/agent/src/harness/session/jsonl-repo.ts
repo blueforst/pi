@@ -893,6 +893,14 @@ export class JsonlSessionBackend {
 	 * the pending set and exposes it via readQuarantinedCommitReceipts. Not
 	 * fsynced on purpose: losing a torn quarantine marker only re-quarantines
 	 * the row on the next recovery pass (idempotent, never emits).
+	 *
+	 * iris_agent#61: the marker MUST respect the same trailing-newline
+	 * invariant as every other append path. A complete final frame whose
+	 * file tail lacks "\n" must not get the quarantine JSON concatenated
+	 * directly onto it — the merged line would fail to parse on the next
+	 * reopen and the whole line (including the previously COMPLETE committed
+	 * frame) would be truncated as one torn unit, turning an integrity
+	 * quarantine into journal corruption/data loss.
 	 */
 	private quarantineCommitReceipt(metadata: JsonlSessionMetadata, entryId: string, reason: string): Promise<void> {
 		this.assertOpen();
@@ -903,6 +911,7 @@ export class JsonlSessionBackend {
 				throw new SessionError("not_found", `Session not found: ${metadata.path}`);
 			}
 			const marker = JSON.stringify({ __piReceiptQuarantine: true, entryId, reason });
+			await this.ensureTrailingNewline(metadata.path);
 			getFileSystemResultOrThrow(
 				await this.fs.appendFile(metadata.path, `${marker}\n`),
 				`Failed to quarantine receipt for entry ${entryId}`,
