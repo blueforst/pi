@@ -112,6 +112,10 @@ export class InMemorySessionBackend {
 			appendEntryWithReceipt: (entry, receipt) => this.appendEntryWithReceipt(state.metadata, entry, receipt),
 			readPendingCommitReceipts: () => this.readPendingCommitReceipts(state.metadata),
 			ackCommitReceipt: (entryId) => this.ackCommitReceipt(state.metadata, entryId),
+			// In-memory ordering is the commit order; the journal is trivially
+			// atomic within the KeyedOperationQueue (serialization, no crash
+			// boundary — declared supported because ordering/identity are exact).
+			supportsCrashRecoverableReceipts: () => true,
 		};
 	}
 

@@ -233,6 +233,9 @@ class SqliteSessionBackend {
 			appendEntryWithReceipt: (entry, receipt) => this.appendEntryWithReceipt(metadata, entry, receipt),
 			readPendingCommitReceipts: () => this.read(metadata, (current) => current.readPendingCommitReceipts()),
 			ackCommitReceipt: (entryId) => this.ackCommitReceipt(metadata, entryId),
+			// The entry insert and the receipt row commit in one SQLite
+			// transaction (WAL + synchronous=FULL): an explicit durability boundary.
+			supportsCrashRecoverableReceipts: () => true,
 		};
 	}
 

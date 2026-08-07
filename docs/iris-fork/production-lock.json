@@ -7,11 +7,11 @@
 	},
 	"acceptedRuntime": {
 		"repository": "blueforst/pi",
-		"commit": "18d059bfdfcc64f75f9974ac8b15a512b2cd8d5c",
-		"tree": "c7b8aa847d8a9141e0620fe797dbafe6fd83802f",
-		"verifiedAt": "2026-08-06",
+		"commit": "8327023a93830e1fb4ef9315c5d1885b167c00c1",
+		"tree": "1822b6a01890ec0a51f0773c107bb20ab70a599e",
+		"verifiedAt": "2026-08-07",
 		"equivalentCommit": "47f85a370a30a34a1e1c4533902f33818651d1b0",
-		"notes": "18d059bf is the accepted fork head containing the iris_agent#40 crash-consistent commit journal (Feature 2: appendEntryWithReceipt atomic append+receipt, recoverPendingCommitReceipts replay, SQLite migration 003) on top of the iris_agent#44 hermetic model catalog (Feature 1: content-addressed committed snapshot, --from-data offline generation, consistency gates) and the earlier #40 appendAndCommitMessage consolidation plus the #41 production-lock fix chain. Its tree is the immutable identity consumers must verify. Prior accepted identity 47f85a37 is an ancestor. acceptedRuntime is the single authoritative identity for the Pi runtime iris_agent is allowed to consume; floating main is never an accepted identity."
+		"notes": "8327023a9 is the accepted fork head containing the iris_agent#51 framed JSONL entry+receipt journal (PI-019) with the full review-hardened torn-tail story: versioned frame (entry + pending receipt + monotonic seq + sha256 checksum) fsynced before success (FileSystem.syncFile); explicit supportsCrashRecoverableReceipts capability requiring BOTH syncFile and truncateFile; missing-newline append guard; physical torn-tail repair via FileSystem.truncateFile with UTF-8 byte-accurate offsets (CJK-safe); torn ack marker and torn bare-entry tails quarantine with typed diagnostics instead of bricking the session; mid-file corruption still fails closed. Prior accepted identity 18d059bf is an ancestor. acceptedRuntime is the single authoritative identity for the Pi runtime iris_agent is allowed to consume; floating main is never an accepted identity."
 	},
 	"upstream": {
 		"repository": "earendil-works/pi",
