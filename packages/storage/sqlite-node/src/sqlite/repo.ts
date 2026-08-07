@@ -65,7 +65,7 @@ class SerialOperationQueue {
 	}
 }
 
-class SqliteSessionBackend {
+export class SqliteSessionBackend {
 	private readonly env: SqliteSessionRepositoryEnv;
 	private readonly sqlite: SqliteDatabaseFactory;
 	private readonly databasePathInput: string;

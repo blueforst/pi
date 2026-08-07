@@ -49,6 +49,28 @@ function decodeEntryRows(entryRows: SessionEntryRow[]): SessionTreeEntry[] {
 	return entries;
 }
 
+/**
+ * iris_agent#62: pure derivation of the in-memory materialized state AFTER
+ * applying `entry` — a defensive copy so the current cached state is never
+ * mutated before the durable write commits. Both appendEntry and
+ * appendEntryWithReceipt compute the SAME next state from the SAME current
+ * state; the publish (cache write) is deferred until the owning transaction
+ * committed, so a rollback leaves the in-memory caches exactly as they were.
+ */
+function nextMaterializedStateAfter(
+	current: SessionMaterializedState,
+	entry: SessionTreeEntry,
+): SessionMaterializedState {
+	const next: SessionMaterializedState = {
+		...current,
+		labelsById: new Map(current.labelsById),
+		modelThinkingConfigs: [...current.modelThinkingConfigs],
+		currentModel: current.currentModel ? { ...current.currentModel } : null,
+	};
+	applyEntryToMaterializedState(next, entry);
+	return next;
+}
+
 async function loadSqliteSession(
 	db: SqliteDatabase,
 	sessionId: string,
@@ -371,21 +393,27 @@ export class SqliteSessionConnection {
 	 * per-session append order, allocated from session_sequences). Callers
 	 * that persist derived rows (e.g. the commit receipt journal) MUST use
 	 * the returned sequence as their ordering key.
+	 *
+	 * iris_agent#62: `publishCache` defaults to true (the entry becomes
+	 * visible in the connection's in-memory materialized state / byId cache
+	 * immediately after its durable write). A caller that wraps the append
+	 * in an OUTER transaction (appendEntryWithReceipt) passes
+	 * publishCache: false and publishes the cache itself only after the
+	 * outer transaction COMMITS — otherwise a receipt-insert or commit
+	 * failure rolls the durable row back but leaves a phantom in-memory
+	 * entry.
 	 */
-	async appendEntry(entry: SessionTreeEntry, options: { transaction?: boolean } = {}): Promise<number> {
+	async appendEntry(
+		entry: SessionTreeEntry,
+		options: { transaction?: boolean; publishCache?: boolean } = {},
+	): Promise<number> {
 		if (entry.type === "leaf" && entry.targetId !== null && !(await this.readEntry(entry.targetId))) {
 			throw new SessionError("not_found", `Entry ${entry.targetId} not found`);
 		}
 		const encoded = encodeEntry(entry);
-		const nextMaterializedState: SessionMaterializedState = {
-			...this.materializedState,
-			labelsById: new Map(this.materializedState.labelsById),
-			modelThinkingConfigs: [...this.materializedState.modelThinkingConfigs],
-			currentModel: this.materializedState.currentModel ? { ...this.materializedState.currentModel } : null,
-		};
+		const nextMaterializedState = nextMaterializedStateAfter(this.materializedState, entry);
 		const nextLeafId = leafIdAfterEntry(entry);
 		try {
-			applyEntryToMaterializedState(nextMaterializedState, entry);
 			let committedSeq = 0;
 			const write = async () => {
 				const nextSeq = await getNextSequence(this.db, this.metadata.id);
@@ -420,13 +448,20 @@ export class SqliteSessionConnection {
 			};
 			if (options.transaction === false) await write();
 			else await this.db.transaction(write);
-			this.materializedState = nextMaterializedState;
-			this.byId.set(entry.id, entry);
+			if (options.publishCache !== false) {
+				this.publishEntryCache(entry, nextMaterializedState);
+			}
 			return committedSeq;
 		} catch (error) {
 			if (error instanceof SessionError) throw error;
 			throw new SessionError("storage", `Failed to append SQLite session entry ${entry.id}`, toError(error));
 		}
+	}
+
+	/** Publish an entry into the connection's in-memory caches. */
+	private publishEntryCache(entry: SessionTreeEntry, nextMaterializedState: SessionMaterializedState): void {
+		this.materializedState = nextMaterializedState;
+		this.byId.set(entry.id, entry);
 	}
 
 	/**
@@ -439,16 +474,27 @@ export class SqliteSessionConnection {
 	 * iris_agent#50: the receipt row carries the entry's authoritative
 	 * entry_seq as receipt_seq (same transaction, so it IS the commit order).
 	 * Replay orders by receipt_seq; timestamps are diagnostics only.
+	 *
+	 * iris_agent#62: the in-memory cache publish happens ONLY after the outer
+	 * transaction commits. The inner append writes durably with
+	 * publishCache: false; if the receipt insert or the outer commit fails,
+	 * SQLite rolls the entry back and the connection's materialized state /
+	 * byId cache stay untouched — no phantom Session entry, no duplicated
+	 * id rejection, no divergence from what a restart reads from disk.
 	 */
 	async appendEntryWithReceipt(entry: SessionTreeEntry, receipt: SessionCommitReceipt): Promise<void> {
+		const nextMaterializedState = nextMaterializedStateAfter(this.materializedState, entry);
 		await this.db.transaction(async () => {
-			const entrySeq = await this.appendEntry(entry, { transaction: false });
+			const entrySeq = await this.appendEntry(entry, { transaction: false, publishCache: false });
 			await this.db
 				.prepare(
 					"INSERT INTO session_commit_receipts (session_id, entry_id, content_hash, committed_at, acked, receipt_seq) VALUES (?, ?, ?, ?, 0, ?)",
 				)
 				.run(this.metadata.id, receipt.entryId, receipt.contentHash, receipt.committedAt, entrySeq);
 		});
+		// The transaction above COMMITTED: durable entry + receipt row are
+		// both on disk. Only now do the in-memory caches become visible.
+		this.publishEntryCache(entry, nextMaterializedState);
 	}
 
 	/** Pending (recorded, not yet acknowledged) receipts in authoritative

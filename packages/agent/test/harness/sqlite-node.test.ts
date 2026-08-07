@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
 	createNodeSqliteFactory,
 	createSqliteSessionSearch,
+	SqliteSessionBackend,
 	type SqliteSessionMetadata,
 	SqliteSessionRepository,
 } from "../../../storage/sqlite-node/src/index.ts";
@@ -50,14 +51,23 @@ describe("JsonlSessionBackend with scanning search", () => {
 	it("searches canonical session entries by scanning", async () => {
 		const root = createTempDir();
 		const env = new NodeExecutionEnv({ cwd: root });
-		const { repository: repo, search } = createJsonlFixture({ fs: env, sessionsRoot: join(root, "sessions") });
+		const { repository: repo, search } = createJsonlFixture({
+			fs: env,
+			sessionsRoot: join(root, "sessions"),
+		});
 		const included = await repo.create({ cwd: root, id: "included" });
-		const excluded = await repo.create({ cwd: `${root}/other`, id: "excluded" });
+		const excluded = await repo.create({
+			cwd: `${root}/other`,
+			id: "excluded",
+		});
 		const entryId = await included.appendMessage(createUserMessage("Find the auth defect"));
 		await excluded.appendMessage(createUserMessage("Find the auth defect"));
 
 		await expect(search.search({ text: "AUTH", cwd: root })).resolves.toEqual([
-			expect.objectContaining({ entryId, metadata: expect.objectContaining({ id: "included" }) }),
+			expect.objectContaining({
+				entryId,
+				metadata: expect.objectContaining({ id: "included" }),
+			}),
 		]);
 	});
 });
@@ -68,18 +78,31 @@ describe("SqliteSessionBackend with explicit SQLite FTS5 search", () => {
 		const env = new NodeExecutionEnv({ cwd: root });
 		const sqlite = createNodeSqliteFactory();
 		const databasePath = join(root, "sessions.sqlite");
-		const { repository: repo, search } = createSqliteFixture({ env, sqlite, databasePath });
+		const { repository: repo, search } = createSqliteFixture({
+			env,
+			sqlite,
+			databasePath,
+		});
 		const included = await repo.create({ cwd: root, id: "included" });
-		const excluded = await repo.create({ cwd: `${root}/other`, id: "excluded" });
+		const excluded = await repo.create({
+			cwd: `${root}/other`,
+			id: "excluded",
+		});
 		const metadata = await included.getMetadata();
 		const entryId = await included.appendMessage(createUserMessage("Find the auth defect"));
 		await excluded.appendMessage(createUserMessage("Find the auth defect"));
 
 		await expect(search.search({ text: "auth", cwd: root })).resolves.toEqual([
-			expect.objectContaining({ entryId, metadata: expect.objectContaining({ id: "included" }) }),
+			expect.objectContaining({
+				entryId,
+				metadata: expect.objectContaining({ id: "included" }),
+			}),
 		]);
 		await expect(search.search({ text: "uth", cwd: root })).resolves.toEqual([
-			expect.objectContaining({ entryId, metadata: expect.objectContaining({ id: "included" }) }),
+			expect.objectContaining({
+				entryId,
+				metadata: expect.objectContaining({ id: "included" }),
+			}),
 		]);
 
 		const db = await sqlite.open(databasePath);
@@ -102,7 +125,11 @@ describe("SqliteSessionBackend with explicit SQLite FTS5 search", () => {
 		const env = new NodeExecutionEnv({ cwd: root });
 		const sqlite = createNodeSqliteFactory();
 		const databasePath = join(root, "sessions.sqlite");
-		const { repository: repo } = createSqliteFixture({ env, sqlite, databasePath });
+		const { repository: repo } = createSqliteFixture({
+			env,
+			sqlite,
+			databasePath,
+		});
 		const session = await repo.create({ cwd: root, id: "session-1" });
 
 		const db = await sqlite.open(databasePath);
@@ -122,7 +149,11 @@ describe("SqliteSessionBackend with explicit SQLite FTS5 search", () => {
 		const env = new NodeExecutionEnv({ cwd: root });
 		const sqlite = createNodeSqliteFactory();
 		const databasePath = join(root, "sessions.sqlite");
-		const { repository: repo, search } = createSqliteFixture({ env, sqlite, databasePath });
+		const { repository: repo, search } = createSqliteFixture({
+			env,
+			sqlite,
+			databasePath,
+		});
 		await search.search({ text: "initialize" });
 		const session = await repo.create({ cwd: root, id: "session-1" });
 
@@ -142,7 +173,11 @@ describe("SqliteSessionBackend with explicit SQLite FTS5 search", () => {
 		const env = new NodeExecutionEnv({ cwd: root });
 		const sqlite = createNodeSqliteFactory();
 		const databasePath = join(root, "sessions.sqlite");
-		const { repository: repo, search } = createSqliteFixture({ env, sqlite, databasePath });
+		const { repository: repo, search } = createSqliteFixture({
+			env,
+			sqlite,
+			databasePath,
+		});
 		await search.search({ text: "initialize" });
 		const session = await repo.create({ cwd: root, id: "session-1" });
 		await session.appendMessage(createUserMessage("must remain"));
@@ -174,7 +209,10 @@ describe("SqliteSessionBackend with explicit SQLite FTS5 search", () => {
 		const entryId = await session.appendMessage(createUserMessage("Find the auth defect"));
 
 		await expect(search.search({ text: "auth" })).resolves.toEqual([
-			expect.objectContaining({ entryId, metadata: expect.objectContaining({ id: "session-1" }) }),
+			expect.objectContaining({
+				entryId,
+				metadata: expect.objectContaining({ id: "session-1" }),
+			}),
 		]);
 		await expect(session.appendMessage(createUserMessage("Still writable"))).resolves.toBeTypeOf("string");
 	});
@@ -228,7 +266,11 @@ describe("SQLite crash-consistent commit journal (iris_agent#40 Feature 2)", () 
 		await repo[Symbol.asyncDispose]();
 
 		// Restart: reopen the same database file.
-		const reopenedRepo = new SqliteSessionRepository({ env, sqlite, databasePath });
+		const reopenedRepo = new SqliteSessionRepository({
+			env,
+			sqlite,
+			databasePath,
+		});
 		ownedRepositories.push(reopenedRepo);
 		const reopened = await reopenedRepo.open(metadata);
 		expect((await reopened.readPendingCommitReceipts()).length).toBe(1);
@@ -250,7 +292,11 @@ describe("SQLite crash-consistent commit journal (iris_agent#40 Feature 2)", () 
 		expect(await reopened.readPendingCommitReceipts()).toEqual([]);
 
 		// Third restart must not re-emit (acked row persisted).
-		const thirdRepo = new SqliteSessionRepository({ env, sqlite, databasePath });
+		const thirdRepo = new SqliteSessionRepository({
+			env,
+			sqlite,
+			databasePath,
+		});
 		ownedRepositories.push(thirdRepo);
 		const third = await thirdRepo.open(metadata);
 		const harness2 = new AgentHarness({
@@ -335,18 +381,23 @@ describe("SQLite crash-consistent commit journal (iris_agent#40 Feature 2)", () 
 		const thirdEntry = JSON.parse(thirdRow.payload) as {
 			message: { role: string; content: unknown; timestamp: number };
 		};
-		await tamperDb
-			.prepare("UPDATE session_entries SET payload = ? WHERE session_id = ? AND id = ?")
-			.run(
-				JSON.stringify({ ...thirdEntry, message: { ...thirdEntry.message, role: "evil" } }),
-				metadata.id,
-				entryIds[2],
-			);
+		await tamperDb.prepare("UPDATE session_entries SET payload = ? WHERE session_id = ? AND id = ?").run(
+			JSON.stringify({
+				...thirdEntry,
+				message: { ...thirdEntry.message, role: "evil" },
+			}),
+			metadata.id,
+			entryIds[2],
+		);
 		await tamperDb.close();
 
 		// Process 2: recovery must quarantine entry 2 (missing_message_entry)
 		// and entry 3 (invalid_role), and still emit entry 1 exactly once.
-		const reopenedRepo = new SqliteSessionRepository({ env, sqlite, databasePath });
+		const reopenedRepo = new SqliteSessionRepository({
+			env,
+			sqlite,
+			databasePath,
+		});
 		ownedRepositories.push(reopenedRepo);
 		const reopened = await reopenedRepo.open(metadata);
 		const finalized: MessageFinalizedEvent[] = [];
@@ -401,7 +452,11 @@ describe("SQLite crash-consistent commit journal (iris_agent#40 Feature 2)", () 
 
 		// Restart and replay: order must follow receipt_seq (append order),
 		// NOT committed_at (all identical) and NOT entry_id (opaque).
-		const reopenedRepo = new SqliteSessionRepository({ env, sqlite, databasePath });
+		const reopenedRepo = new SqliteSessionRepository({
+			env,
+			sqlite,
+			databasePath,
+		});
 		ownedRepositories.push(reopenedRepo);
 		const reopened = await reopenedRepo.open(metadata);
 		const pending = await reopened.readPendingCommitReceipts();
@@ -457,7 +512,11 @@ describe("SQLite crash-consistent commit journal (iris_agent#40 Feature 2)", () 
 
 		// Process 2: recovery must emit 2/3 (valid ones), quarantine the
 		// tampered one with a typed reason, and never ack it.
-		const reopenedRepo = new SqliteSessionRepository({ env, sqlite, databasePath });
+		const reopenedRepo = new SqliteSessionRepository({
+			env,
+			sqlite,
+			databasePath,
+		});
 		ownedRepositories.push(reopenedRepo);
 		const reopened = await reopenedRepo.open(metadata);
 		const finalized: MessageFinalizedEvent[] = [];
@@ -488,7 +547,11 @@ describe("SQLite crash-consistent commit journal (iris_agent#40 Feature 2)", () 
 		expect((await reopened.readQuarantinedCommitReceipts()).length).toBe(1);
 
 		// Third process: quarantine persists across restart.
-		const thirdRepo = new SqliteSessionRepository({ env, sqlite, databasePath });
+		const thirdRepo = new SqliteSessionRepository({
+			env,
+			sqlite,
+			databasePath,
+		});
 		ownedRepositories.push(thirdRepo);
 		const third = await thirdRepo.open(metadata);
 		const thirdHarness = new AgentHarness({
@@ -504,5 +567,164 @@ describe("SQLite crash-consistent commit journal (iris_agent#40 Feature 2)", () 
 		expect(await thirdHarness.recoverPendingCommitReceipts()).toBe(0);
 		expect(thirdFinalized.length).toBe(0);
 		expect((await third.readQuarantinedCommitReceipts()).length).toBe(1);
+	});
+
+	it("iris_agent#62: a failed receipt transaction leaves NO phantom in-memory Session entry (cache publishes only after commit)", async () => {
+		const root = createTempDir();
+		const env = new NodeExecutionEnv({ cwd: root });
+		const databasePath = join(root, "sessions.sqlite");
+		const sqlite = createNodeSqliteFactory();
+
+		// Process 1: create the session so the schema + session row exist.
+		const repo = new SqliteSessionRepository({ env, sqlite, databasePath });
+		const session = await repo.create({ cwd: root, id: "session-phantom" });
+		const metadata = await session.getMetadata();
+		await repo[Symbol.asyncDispose]();
+
+		// Fault injection: make the receipt INSERT fail (entry SQL has already
+		// succeeded inside the same transaction). A BEFORE INSERT trigger on
+		// session_commit_receipts aborts the outer transaction exactly where
+		// the issue's failure point is.
+		const faultDb = await sqlite.open(databasePath);
+		await faultDb.exec(`
+		CREATE TRIGGER fail_receipt_insert
+		BEFORE INSERT ON session_commit_receipts
+		BEGIN
+		SELECT RAISE(ABORT, 'injected receipt insert failure');
+		END;
+		`);
+		await faultDb.close();
+
+		// Process 2: same database, receipt insert always fails. Use the
+		// backend DIRECTLY with an explicit entry id so the in-memory caches
+		// (byId / materializedState) are observable after the rollback.
+		const failedRepo = new SqliteSessionRepository({
+			env,
+			sqlite,
+			databasePath,
+		});
+		ownedRepositories.push(failedRepo);
+		await failedRepo.open(metadata);
+		const backend = new SqliteSessionBackend({ env, sqlite, databasePath });
+		const failedStorage = await backend.open(metadata);
+		const message = createUserMessage("must never become a phantom");
+		const contentHash = await computeMessageContentHash(message);
+		const phantomEntry = {
+			id: "phantom-entry-1",
+			parentId: null,
+			timestamp: new Date().toISOString(),
+			type: "message" as const,
+			message,
+		};
+		await expect(
+			failedStorage.appendEntryWithReceipt!(phantomEntry, {
+				sessionId: metadata.id,
+				entryId: phantomEntry.id,
+				contentHash,
+				committedAt: new Date().toISOString(),
+			}),
+		).rejects.toThrow(/injected receipt insert failure/);
+
+		// After the rollback the in-memory connection must behave EXACTLY as if
+		// the append never happened:
+		//  - readEntry (byId cache) finds nothing;
+		//  - readEntries (DB) finds nothing;
+		//  - no pending receipt;
+		//  - a retry of the SAME entry id is NOT rejected as a duplicate
+		//    (a phantom byId entry would make the retry fail with a duplicate).
+		expect(await failedStorage.readEntry?.("phantom-entry-1")).toBeUndefined();
+		expect((await failedStorage.readEntries?.())?.length ?? 0).toBe(0);
+		expect(await failedStorage.readPendingCommitReceipts?.()).toEqual([]);
+
+		// Remove the fault, retry the SAME logical append exactly once.
+		const healDb = await sqlite.open(databasePath);
+		await healDb.exec("DROP TRIGGER fail_receipt_insert");
+		await healDb.close();
+		await failedStorage.appendEntryWithReceipt!(phantomEntry, {
+			sessionId: metadata.id,
+			entryId: phantomEntry.id,
+			contentHash,
+			committedAt: new Date().toISOString(),
+		});
+		expect((await failedStorage.readEntries?.())?.length ?? 0).toBe(1);
+		const pendingAfterRetry = await failedStorage.readPendingCommitReceipts?.();
+		expect(pendingAfterRetry?.length ?? 0).toBe(1);
+		// The retry got seq 1 — the failed transaction did NOT advance the
+		// cached sequence (a phantom would have consumed seq 1).
+		expect(pendingAfterRetry?.[0]?.entrySeq).toBe(1);
+		expect(pendingAfterRetry?.[0]?.entryId).toBe("phantom-entry-1");
+
+		// Restart: same-process and restarted observations agree.
+		await backend[Symbol.asyncDispose]();
+		await failedRepo[Symbol.asyncDispose]();
+		const restartedRepo = new SqliteSessionRepository({
+			env,
+			sqlite,
+			databasePath,
+		});
+		ownedRepositories.push(restartedRepo);
+		const restarted = await restartedRepo.open(metadata);
+		expect((await restarted.getEntries()).length).toBe(1);
+		expect((await restarted.readPendingCommitReceipts()).map((r) => r.entryId)).toEqual(["phantom-entry-1"]);
+	});
+
+	it("iris_agent#62: successful append+receipt still publishes caches once, in authoritative seq order", async () => {
+		const root = createTempDir();
+		const env = new NodeExecutionEnv({ cwd: root });
+		const databasePath = join(root, "sessions.sqlite");
+		const sqlite = createNodeSqliteFactory();
+
+		const repo = new SqliteSessionRepository({ env, sqlite, databasePath });
+		ownedRepositories.push(repo);
+		const session = await repo.create({ cwd: root, id: "session-cache-once" });
+		const metadata = await session.getMetadata();
+		const first = createUserMessage("first");
+		const second = createUserMessage("second");
+		const hash1 = await computeMessageContentHash(first);
+		const hash2 = await computeMessageContentHash(second);
+		const { entryId: entryId1 } = await session.appendMessageWithCommitReceipt(first, (id) => ({
+			sessionId: metadata.id,
+			entryId: id,
+			contentHash: hash1,
+			committedAt: new Date().toISOString(),
+		}));
+		await session.appendMessageWithCommitReceipt(second, (id) => ({
+			sessionId: metadata.id,
+			entryId: id,
+			contentHash: hash2,
+			committedAt: new Date().toISOString(),
+		}));
+
+		// Caches visible immediately (same-process reads).
+		expect((await session.getEntries()).length).toBe(2);
+		expect((await session.getEntry(entryId1))?.type).toBe("message");
+		// Authoritative order: entry_seq 1 then 2 (same millisecond timestamps
+		// would still order by seq, not committed_at).
+		expect((await session.readPendingCommitReceipts()).map((r) => r.entrySeq)).toEqual([1, 2]);
+
+		// Duplicate-id rejection still works from the cache after the retry
+		// (single publish): replay the same entry id through the backend.
+		const backend = new SqliteSessionBackend({ env, sqlite, databasePath });
+		const storage = await backend.open(metadata);
+		await expect(
+			storage.appendEntryWithReceipt!(
+				{
+					id: entryId1,
+					parentId: null,
+					timestamp: new Date().toISOString(),
+					type: "message",
+					message: first,
+				},
+				{
+					sessionId: metadata.id,
+					entryId: entryId1,
+					contentHash: hash1,
+					committedAt: new Date().toISOString(),
+				},
+			),
+		).rejects.toThrow(/Failed to append SQLite session entry/);
+		// The rejected duplicate attempt did not create a third entry.
+		expect((await storage.readEntries()).length).toBe(2);
+		await backend[Symbol.asyncDispose]();
 	});
 });
