@@ -511,6 +511,46 @@ describe("JSONL framed journal crash-safety (iris_agent#51)", () => {
 		await repo[Symbol.asyncDispose]();
 	});
 
+	it("iris_agent#50: quarantined receipts are persisted via marker, excluded from pending, visible in diagnostics", async () => {
+		const root = createTempDir();
+		const fs = new NodeExecutionEnv({ cwd: root });
+		const repo = new JsonlSessionRepository({ fs, sessionsRoot: root });
+		const session = await repo.create({ cwd: root, id: "quarantine-1" });
+		const metadata = await session.getMetadata();
+		const first = createUserMessage("valid pair");
+		const second = createUserMessage("pair to quarantine");
+		const hash1 = await computeMessageContentHash(first);
+		const hash2 = await computeMessageContentHash(second);
+		const { entryId: secondId } = await session.appendMessageWithCommitReceipt(second, (id) => receiptFor(id, hash2));
+		await session.appendMessageWithCommitReceipt(first, (id) => receiptFor(id, hash1));
+		const sessionPath = metadata.path;
+
+		// Quarantine the middle receipt (tampered content hash scenario).
+		await session.quarantineCommitReceipt(secondId, "content_hash_mismatch: tampered");
+
+		// Pending excludes it; diagnostics expose it with the typed reason.
+		const pending = await session.readPendingCommitReceipts();
+		expect(pending.length).toBe(1);
+		expect(pending[0]!.entryId).not.toBe(secondId);
+		const quarantined = await session.readQuarantinedCommitReceipts();
+		expect(quarantined.length).toBe(1);
+		expect(quarantined[0]!.entryId).toBe(secondId);
+		expect(quarantined[0]!.reason).toContain("content_hash_mismatch");
+
+		// Quarantine marker persists across reopen; the valid receipt stays
+		// pending (never acked), the quarantined one is never re-exposed.
+		await repo[Symbol.asyncDispose]();
+		const { session: reopened, repo: reopenedRepo } = await openSessionFile(sessionPath);
+		const reopenedPending = await reopened.readPendingCommitReceipts();
+		expect(reopenedPending.length).toBe(1);
+		expect(reopenedPending[0]!.entryId).not.toBe(secondId);
+		const persisted = await reopened.readQuarantinedCommitReceipts();
+		expect(persisted.length).toBe(1);
+		expect(persisted[0]!.entryId).toBe(secondId);
+		expect(persisted[0]!.reason).toContain("content_hash_mismatch");
+		await reopenedRepo[Symbol.asyncDispose]();
+	});
+
 	it("recovery stays idempotent across restarts: acked pairs never re-emit", async () => {
 		const root = createTempDir();
 		const fs = new NodeExecutionEnv({ cwd: root });

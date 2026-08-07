@@ -3,6 +3,7 @@ import type {
 	JsonlSessionCreateOptions,
 	JsonlSessionListOptions,
 	JsonlSessionMetadata,
+	QuarantinedCommitReceipt,
 	SessionCommitReceipt,
 	SessionForkOptions,
 	SessionForkSelection,
@@ -174,6 +175,7 @@ async function loadJsonlSession(fs: JsonlSessionFileSystem, path: string): Promi
 	const header = parseHeader(lines[0]!, path);
 	const entries: SessionTreeEntry[] = [];
 	const pendingReceipts: { receipt: SessionCommitReceipt; order: number }[] = [];
+	const quarantinedReceipts: { receipt: QuarantinedCommitReceipt; order: number }[] = [];
 	const diagnostics: string[] = [];
 	let maxJournalSeq = 0;
 	let tornTailCleanLength: number | undefined;
@@ -215,7 +217,12 @@ async function loadJsonlSession(fs: JsonlSessionFileSystem, path: string): Promi
 			if (quarantineTail("line is not an object")) continue;
 			throw invalidEntry(path, lineNumber, "is not a valid session entry");
 		}
-		const record = value as { __piReceipt?: unknown; __piReceiptAck?: unknown; __piJournal?: unknown };
+		const record = value as {
+			__piReceipt?: unknown;
+			__piReceiptAck?: unknown;
+			__piReceiptQuarantine?: unknown;
+			__piJournal?: unknown;
+		};
 		if (record.__piReceipt === true) {
 			// Legacy pre-framing marker line: receipt-only; the entry is the
 			// bare entry line written immediately before it. Torn marker tails
@@ -242,6 +249,31 @@ async function loadJsonlSession(fs: JsonlSessionFileSystem, path: string): Promi
 			}
 			const index = pendingReceipts.findIndex((p) => p.receipt.entryId === entryId);
 			if (index >= 0) pendingReceipts.splice(index, 1);
+			continue;
+		}
+		if (record.__piReceiptQuarantine === true) {
+			// iris_agent#50: a recovery integrity failure permanently
+			// quarantines the receipt (never emitted, never acked). The
+			// marker carries the typed reason and the receipt snapshot.
+			const entryId = (record as { entryId?: unknown }).entryId;
+			const reason = (record as { reason?: unknown }).reason;
+			const receipt = (record as { receipt?: SessionCommitReceipt }).receipt;
+			if (typeof entryId !== "string" || !entryId || typeof reason !== "string" || !reason) {
+				if (quarantineTail("quarantine marker is missing entryId or reason")) continue;
+				throw invalidEntry(path, lineNumber, "quarantine marker is missing entryId or reason");
+			}
+			const index = pendingReceipts.findIndex((p) => p.receipt.entryId === entryId);
+			if (index >= 0) pendingReceipts.splice(index, 1);
+			quarantinedReceipts.push({
+				receipt: {
+					entryId,
+					reason,
+					...(receipt?.contentHash !== undefined ? { contentHash: receipt.contentHash } : {}),
+					...(receipt?.committedAt !== undefined ? { committedAt: receipt.committedAt } : {}),
+					...(receipt?.entrySeq !== undefined ? { entrySeq: receipt.entrySeq } : {}),
+				},
+				order: lineNumber,
+			});
 			continue;
 		}
 		if (record.__piJournal === 1) {
@@ -285,6 +317,7 @@ async function loadJsonlSession(fs: JsonlSessionFileSystem, path: string): Promi
 		metadata: metadataFromHeader(header, path),
 		entries,
 		pendingReceipts,
+		quarantinedReceipts,
 		diagnostics,
 		maxJournalSeq,
 		tailEndsWithNewline: content.endsWith("\n"),
@@ -305,10 +338,20 @@ export function isReceiptJournalLine(line: string): boolean {
 		return false;
 	}
 	if (typeof value !== "object" || value === null) return false;
-	const record = value as { __piReceipt?: unknown; __piReceiptAck?: unknown; __piJournal?: unknown };
+	const record = value as {
+		__piReceipt?: unknown;
+		__piReceiptAck?: unknown;
+		__piReceiptQuarantine?: unknown;
+		__piJournal?: unknown;
+	};
 	// Structural check, not substring matching: a legitimate entry whose message
 	// text merely contains "__piReceiptAck" must never be mistaken for a marker.
-	return record.__piReceipt === true || record.__piReceiptAck === true || record.__piJournal === 1;
+	return (
+		record.__piReceipt === true ||
+		record.__piReceiptAck === true ||
+		record.__piReceiptQuarantine === true ||
+		record.__piJournal === 1
+	);
 }
 
 /**
@@ -426,6 +469,8 @@ interface JsonlSessionLoadResult {
 	entries: SessionTreeEntry[];
 	/** Pending receipts in commit order, with the journal seq when known. */
 	pendingReceipts: { receipt: SessionCommitReceipt; order: number }[];
+	/** Quarantined receipts (iris_agent#50) in file order, with typed reasons. */
+	quarantinedReceipts: { receipt: QuarantinedCommitReceipt; order: number }[];
 	/** Torn-tail / corruption diagnostics from this load (typed, human-readable). */
 	diagnostics: string[];
 	/**
@@ -741,6 +786,8 @@ export class JsonlSessionBackend {
 			appendEntryWithReceipt: (entry, receipt) => this.appendEntryWithReceipt(metadata, entry, receipt),
 			readPendingCommitReceipts: () => this.readPendingCommitReceipts(metadata),
 			ackCommitReceipt: (entryId) => this.ackCommitReceipt(metadata, entryId),
+			quarantineCommitReceipt: (entryId, reason) => this.quarantineCommitReceipt(metadata, entryId, reason),
+			readQuarantinedCommitReceipts: () => this.readQuarantinedCommitReceipts(metadata),
 			supportsCrashRecoverableReceipts: () => this.supportsCrashRecoverableReceipts(),
 			journalDiagnostics: () => this.journalDiagnostics(metadata),
 		};
@@ -836,6 +883,41 @@ export class JsonlSessionBackend {
 				await this.fs.appendFile(metadata.path, `${marker}\n`),
 				`Failed to acknowledge receipt for entry ${entryId}`,
 			);
+		});
+	}
+
+	/**
+	 * iris_agent#50: permanently quarantine a receipt that failed recovery
+	 * integrity validation. Appends an append-only marker carrying the typed
+	 * reason and the receipt snapshot; the loader removes the receipt from
+	 * the pending set and exposes it via readQuarantinedCommitReceipts. Not
+	 * fsynced on purpose: losing a torn quarantine marker only re-quarantines
+	 * the row on the next recovery pass (idempotent, never emits).
+	 */
+	private quarantineCommitReceipt(metadata: JsonlSessionMetadata, entryId: string, reason: string): Promise<void> {
+		this.assertOpen();
+		return this.operations.enqueue(this.operationKey(metadata), async () => {
+			if (
+				!getFileSystemResultOrThrow(await this.fs.exists(metadata.path), `Failed to check session ${metadata.path}`)
+			) {
+				throw new SessionError("not_found", `Session not found: ${metadata.path}`);
+			}
+			const marker = JSON.stringify({ __piReceiptQuarantine: true, entryId, reason });
+			getFileSystemResultOrThrow(
+				await this.fs.appendFile(metadata.path, `${marker}\n`),
+				`Failed to quarantine receipt for entry ${entryId}`,
+			);
+		});
+	}
+
+	/** iris_agent#50: quarantined receipts in file order (health diagnostics). */
+	private async readQuarantinedCommitReceipts(
+		metadata: JsonlSessionMetadata,
+	): Promise<readonly QuarantinedCommitReceipt[]> {
+		this.assertOpen();
+		return this.operations.enqueue(this.operationKey(metadata), async () => {
+			const document = await loadJsonlSession(this.fs, metadata.path);
+			return [...document.quarantinedReceipts].sort((a, b) => a.order - b.order).map((pending) => pending.receipt);
 		});
 	}
 

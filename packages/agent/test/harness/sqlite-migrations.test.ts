@@ -101,12 +101,22 @@ describe("SQLite migrations", () => {
 
 		const db = await sqlite.open(databasePath);
 		try {
-			const rows = await db.prepare("SELECT id FROM migrations ORDER BY id").all<{ id: string }>();
+			const rows = await db
+				.prepare("SELECT id, checksum FROM migrations ORDER BY id")
+				.all<{ id: string; checksum: string }>();
 			expect(rows.map((row) => row.id)).toEqual([
 				"001_initial.sql",
 				"002_branch_tips.sql",
 				"003_commit_receipts.sql",
+				"004_receipt_seq.sql",
+				"005_quarantine.sql",
 			]);
+			// iris_agent#50: every applied migration carries a release-owned
+			// sha256 checksum of its SQL (fail closed if a released migration
+			// is edited in place after being applied).
+			for (const row of rows) {
+				expect(row.checksum).toMatch(/^[0-9a-f]{64}$/);
+			}
 			const tables = await db
 				.prepare("SELECT name, sql FROM sqlite_master WHERE type = 'table' ORDER BY name")
 				.all<{ name: string; sql: string | null }>();
@@ -170,7 +180,87 @@ describe("SQLite migrations", () => {
 			).toBeDefined();
 			expect(
 				(await db.prepare("SELECT id FROM migrations ORDER BY id").all<{ id: string }>()).map((row) => row.id),
-			).toEqual(["001_initial.sql", "002_branch_tips.sql", "003_commit_receipts.sql"]);
+			).toEqual([
+				"001_initial.sql",
+				"002_branch_tips.sql",
+				"003_commit_receipts.sql",
+				"004_receipt_seq.sql",
+				"005_quarantine.sql",
+			]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it("iris_agent#50: a 003-era database upgrades cleanly and backfills receipt_seq from entry order", async () => {
+		const root = createTempDir();
+		const databasePath = join(root, "sessions.sqlite");
+		const sqlite = createNodeSqliteFactory();
+		const db = await sqlite.open(databasePath);
+		try {
+			// Build a pre-004 database by hand: apply 001-003 only, insert a
+			// session + entries + receipt rows (the 003-era writer shape).
+			await db.exec("CREATE TABLE migrations (id TEXT PRIMARY KEY, applied_at TEXT NOT NULL)");
+			for (const id of ["001_initial.sql", "002_branch_tips.sql", "003_commit_receipts.sql"]) {
+				const migration = (await loadMigrations()).find((m) => m.id === id);
+				if (!migration) throw new Error(`Missing ${id}`);
+				await db.exec(migration.sql);
+				await db
+					.prepare("INSERT INTO migrations (id, applied_at) VALUES (?, ?)")
+					.run(migration.id, new Date().toISOString());
+			}
+			await db
+				.prepare(
+					"INSERT INTO sessions (id, created_at, metadata, cwd, parent_session_id, active_leaf_id) VALUES (?, ?, ?, ?, NULL, NULL)",
+				)
+				.run("legacy-session", "2026-01-01T00:00:00.000Z", "{}", root);
+			for (const [entryId, seq] of [
+				["e1", 1],
+				["e2", 2],
+				["e3", 3],
+			] as const) {
+				await db
+					.prepare(
+						"INSERT INTO session_entries (session_id, id, entry_seq, parent_id, type, timestamp, payload) VALUES (?, ?, ?, NULL, 'message', ?, '{}')",
+					)
+					.run("legacy-session", entryId, seq, "2026-01-01T00:00:00.000Z");
+				await db
+					.prepare(
+						"INSERT INTO session_commit_receipts (session_id, entry_id, content_hash, committed_at, acked) VALUES (?, ?, ?, ?, 0)",
+					)
+					.run("legacy-session", entryId, "hash".padEnd(64, "0"), "2026-01-01T00:00:00.000Z");
+			}
+
+			// Upgrade: 004 backfills receipt_seq = entry_seq (append order),
+			// 005 adds the quarantine column.
+			await applyMigrations(db);
+			const rows = await db
+				.prepare(
+					"SELECT entry_id, receipt_seq, quarantine_reason FROM session_commit_receipts ORDER BY receipt_seq",
+				)
+				.all<{ entry_id: string; receipt_seq: number; quarantine_reason: string | null }>();
+			expect(rows.map((row) => row.entry_id)).toEqual(["e1", "e2", "e3"]);
+			expect(rows.map((row) => row.receipt_seq)).toEqual([1, 2, 3]);
+			expect(rows.every((row) => row.quarantine_reason === null)).toBe(true);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it("iris_agent#50: a migration edited in place after being applied fails closed (release-owned checksum)", async () => {
+		const root = createTempDir();
+		const databasePath = join(root, "sessions.sqlite");
+		const sqlite = createNodeSqliteFactory();
+		const db = await sqlite.open(databasePath);
+		try {
+			// Apply all migrations, then corrupt the recorded checksum of an
+			// applied migration (simulating a released migration file that
+			// changed after being applied elsewhere).
+			await applyMigrations(db);
+			await db
+				.prepare("UPDATE migrations SET checksum = ? WHERE id = ?")
+				.run("0".repeat(64), "003_commit_receipts.sql");
+			await expect(applyMigrations(db)).rejects.toThrow(/checksum mismatch/);
 		} finally {
 			await db.close();
 		}

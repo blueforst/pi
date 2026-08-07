@@ -596,6 +596,17 @@ export interface SessionStorage<TMetadata extends SessionMetadata = SessionMetad
 	readPendingCommitReceipts?(): Promise<readonly SessionCommitReceipt[]>;
 	ackCommitReceipt?(entryId: string): Promise<void>;
 	/**
+	 * iris_agent#50: permanently quarantine a corrupt/tampered receipt row so
+	 * recovery never emits or acks it (fail closed, typed reason, remains
+	 * visible via {@link readQuarantinedCommitReceipts}). Backends persist the
+	 * quarantine (SQLite acked=2 + reason, JSONL append-only marker, memory
+	 * map); a lost quarantine marker only re-quarantines on the next pass
+	 * (idempotent).
+	 */
+	quarantineCommitReceipt?(entryId: string, reason: string): Promise<void>;
+	/** iris_agent#50: quarantined receipts in commit order (health diagnostics). */
+	readQuarantinedCommitReceipts?(): Promise<readonly QuarantinedCommitReceipt[]>;
+	/**
 	 * Explicit durability capability (iris_agent#51). Implementations that
 	 * persist the entry+receipt pair atomically (SQLite transaction, memory
 	 * ordering, framed JSONL journal with fsync) return true. A backend that
@@ -798,6 +809,22 @@ export interface SessionCommitReceipt {
 	entrySeq?: number;
 	contentHash: string;
 	committedAt: string;
+}
+
+/**
+ * A receipt quarantined by recovery (iris_agent#50): recovery validation
+ * (session id, entry existence/type/role, recomputed canonical content hash)
+ * failed for this row, so it was never emitted and never acknowledged.
+ * Quarantined rows stay visible to health/diagnostics consumers and are
+ * skipped by every later recovery pass (invalid receipts emit zero times).
+ */
+export interface QuarantinedCommitReceipt {
+	entryId: string;
+	/** Typed integrity failure reason, e.g. `content_hash_mismatch`. */
+	reason: string;
+	contentHash?: string;
+	committedAt?: string;
+	entrySeq?: number;
 }
 
 /**

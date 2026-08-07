@@ -162,6 +162,22 @@ function applyStreamOptionsPatch(
 
 const SUBSCRIBER_EVENT_TYPE = "*";
 
+/**
+ * iris_agent#50: known AgentMessage roles (base Message roles "user" /
+ * "assistant" / "toolResult" plus the harness custom message roles declared
+ * in messages.ts). Used to fail closed on a corrupted/tampered entry whose
+ * role matches no known shape during receipt recovery.
+ */
+const VALID_MESSAGE_ROLES: ReadonlySet<string> = new Set([
+	"user",
+	"assistant",
+	"toolResult",
+	"bashExecution",
+	"custom",
+	"branchSummary",
+	"compactionSummary",
+]);
+
 type AgentHarnessHandler = (event: any, signal?: AbortSignal) => Promise<any> | any;
 
 type TrackedTaskKind = "operation" | "mutation";
@@ -702,17 +718,59 @@ export class AgentHarness<
 	 * Pending receipts are replayed in commit order. Returns the number of
 	 * receipts replayed. Call after subscribing, before running new turns, when
 	 * reopening a session after a crash.
+	 *
+	 * iris_agent#50 integrity validation: BEFORE emitting or ACKing, every
+	 * pending receipt is verified against the durable Session:
+	 * - receipt.sessionId MUST equal the reopened Session id;
+	 * - the entry MUST exist, be a message, and carry a valid role;
+	 * - the content hash is RECOMPUTED from the entry's message via the same
+	 *   canonical hashing implementation as the normal append path and MUST
+	 *   match the receipt.
+	 * Any mismatch fails closed with a typed reason and PERMANENTLY
+	 * QUARANTINES the row (never emitted, never acked, visible via
+	 * {@link Session.readQuarantinedCommitReceipts}); recovery continues with
+	 * the remaining receipts in commit order, so valid receipts emit exactly
+	 * once and invalid receipts emit zero times (retry/restart idempotent).
 	 */
 	async recoverPendingCommitReceipts(): Promise<number> {
+		const sessionMetadata = await this.session.getMetadata();
 		const pending = await this.session.readPendingCommitReceipts();
 		let replayed = 0;
 		for (const receipt of pending) {
+			if (receipt.sessionId !== sessionMetadata.id) {
+				await this.session.quarantineCommitReceipt(
+					receipt.entryId,
+					`session_id_mismatch: receipt sessionId ${JSON.stringify(receipt.sessionId)} != reopened session ${JSON.stringify(sessionMetadata.id)}`,
+				);
+				continue;
+			}
 			const entry = await this.session.getEntry(receipt.entryId);
 			if (!entry || entry.type !== "message") {
-				throw new AgentHarnessError(
-					"session",
-					`Pending commit receipt ${receipt.entryId} has no recoverable message entry`,
+				await this.session.quarantineCommitReceipt(
+					receipt.entryId,
+					`missing_message_entry: no recoverable message entry (got ${entry?.type ?? "missing"})`,
 				);
+				continue;
+			}
+			const role = entry.message.role;
+			// iris_agent#50: the role must be a known AgentMessage role (base
+			// Message roles + the harness custom message roles). A corrupted or
+			// tampered entry whose role does not match any known shape fails
+			// closed instead of being replayed into the lifecycle.
+			if (!VALID_MESSAGE_ROLES.has(role)) {
+				await this.session.quarantineCommitReceipt(
+					receipt.entryId,
+					`invalid_role: message role ${JSON.stringify(role)} is not a known AgentMessage role`,
+				);
+				continue;
+			}
+			const recomputed = await computeMessageContentHash(entry.message);
+			if (recomputed !== receipt.contentHash) {
+				await this.session.quarantineCommitReceipt(
+					receipt.entryId,
+					`content_hash_mismatch: entry message hashes to ${recomputed} but the receipt records ${receipt.contentHash}`,
+				);
+				continue;
 			}
 			await this.emitOwn({
 				type: "message_finalized",
