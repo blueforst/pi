@@ -26,7 +26,9 @@ function makeNoSyncFs(root: string): NodeExecutionEnv {
 	// NodeExecutionEnv always supports syncFile; shadow the method with
 	// `undefined` at runtime so the backend's capability probe
 	// (`fs.syncFile === undefined`) sees none.
-	const env = new NodeExecutionEnv({ cwd: root }) as unknown as { syncFile?: unknown };
+	const env = new NodeExecutionEnv({ cwd: root }) as unknown as {
+		syncFile?: unknown;
+	};
 	Object.defineProperty(env, "syncFile", { value: undefined, writable: true });
 	return env as unknown as NodeExecutionEnv;
 }
@@ -58,8 +60,14 @@ describe("JSONL framed journal crash-safety (iris_agent#51)", () => {
 
 		const noSyncRoot = createTempDir();
 		const noSyncFs = makeNoSyncFs(noSyncRoot);
-		const noSyncRepo = new JsonlSessionRepository({ fs: noSyncFs, sessionsRoot: noSyncRoot });
-		const noSyncSession = await noSyncRepo.create({ cwd: noSyncRoot, id: "cap-2" });
+		const noSyncRepo = new JsonlSessionRepository({
+			fs: noSyncFs,
+			sessionsRoot: noSyncRoot,
+		});
+		const noSyncSession = await noSyncRepo.create({
+			cwd: noSyncRoot,
+			id: "cap-2",
+		});
 		expect(noSyncSession.supportsCrashRecoverableReceipts()).toBe(false);
 		await noSyncRepo[Symbol.asyncDispose]();
 		await repo[Symbol.asyncDispose]();
@@ -68,13 +76,22 @@ describe("JSONL framed journal crash-safety (iris_agent#51)", () => {
 	it("fails closed on the journal seam when the filesystem cannot fsync", async () => {
 		const root = createTempDir();
 		const noSyncFs = makeNoSyncFs(root);
-		const backend = new JsonlSessionBackend({ fs: noSyncFs, sessionsRoot: root });
+		const backend = new JsonlSessionBackend({
+			fs: noSyncFs,
+			sessionsRoot: root,
+		});
 		const storage = await backend.create({ cwd: root, id: "no-fsync-1" });
 		const message = createUserMessage("crash window");
 		const contentHash = await computeMessageContentHash(message);
 		await expect(
 			storage.appendEntryWithReceipt!(
-				{ id: "e1", parentId: null, timestamp: new Date().toISOString(), type: "message", message },
+				{
+					id: "e1",
+					parentId: null,
+					timestamp: new Date().toISOString(),
+					type: "message",
+					message,
+				},
 				receiptFor("e1", contentHash),
 			),
 		).rejects.toThrow(/syncFile/);
@@ -84,7 +101,10 @@ describe("JSONL framed journal crash-safety (iris_agent#51)", () => {
 	it("falls back to a plain append (publish-only receipts) on an fsync-less backend instead of pretending durability", async () => {
 		const root = createTempDir();
 		const noSyncFs = makeNoSyncFs(root);
-		const repo = new JsonlSessionRepository({ fs: noSyncFs, sessionsRoot: root });
+		const repo = new JsonlSessionRepository({
+			fs: noSyncFs,
+			sessionsRoot: root,
+		});
 		const session = await repo.create({ cwd: root, id: "no-fsync-2" });
 		const metadata = await session.getMetadata();
 		const message = createUserMessage("plain append on fsync-less fs");
@@ -178,7 +198,10 @@ describe("JSONL framed journal crash-safety (iris_agent#51)", () => {
 		const flipped1 = frame1.replace(/(?<=checksum":")[0-9a-f]/, (c) => (c === "0" ? "1" : "0"));
 		writeFileSync(join(tmpMid, "s.jsonl"), `${lines[0]}\n${flipped1}\n${lines[2]}\n`);
 		const midFs = new NodeExecutionEnv({ cwd: tmpMid });
-		const midRepo = new JsonlSessionRepository({ fs: midFs, sessionsRoot: tmpMid });
+		const midRepo = new JsonlSessionRepository({
+			fs: midFs,
+			sessionsRoot: tmpMid,
+		});
 		const midMetadata = await loadJsonlSessionMetadata(midFs, join(tmpMid, "s.jsonl"));
 		await expect(midRepo.open(midMetadata)).rejects.toThrow(/checksum mismatch|not valid JSON/);
 		await midRepo[Symbol.asyncDispose]();
@@ -447,8 +470,11 @@ describe("JSONL framed journal crash-safety (iris_agent#51)", () => {
 		{
 			const { session: reopened, repo: reopenedRepo } = await openSessionFile(sessionPath);
 			expect((await reopened.getEntries()).length).toBe(2);
-			const text = ((await reopened.getEntries())[0] as { message: { content: Array<{ text: string }> } }).message
-				.content[0]!.text;
+			const text = (
+				(await reopened.getEntries())[0] as {
+					message: { content: Array<{ text: string }> };
+				}
+			).message.content[0]!.text;
 			expect(text).toBe("第一帧：中文内容 unicode 多字节，必须毫发无损");
 			expect(await reopened.journalDiagnostics()).toEqual([]);
 			await reopenedRepo[Symbol.asyncDispose]();
@@ -494,11 +520,19 @@ describe("JSONL framed journal crash-safety (iris_agent#51)", () => {
 
 	it("capability requires BOTH fsync and truncate: syncFile without truncateFile is not crash-recoverable", async () => {
 		const root = createTempDir();
-		const env = new NodeExecutionEnv({ cwd: root }) as unknown as { truncateFile?: unknown };
+		const env = new NodeExecutionEnv({ cwd: root }) as unknown as {
+			truncateFile?: unknown;
+		};
 		// Shadow the prototype method with `undefined` (delete does not
 		// remove inherited properties).
-		Object.defineProperty(env, "truncateFile", { value: undefined, writable: true });
-		const repo = new JsonlSessionRepository({ fs: env as unknown as NodeExecutionEnv, sessionsRoot: root });
+		Object.defineProperty(env, "truncateFile", {
+			value: undefined,
+			writable: true,
+		});
+		const repo = new JsonlSessionRepository({
+			fs: env as unknown as NodeExecutionEnv,
+			sessionsRoot: root,
+		});
 		const session = await repo.create({ cwd: root, id: "cap-sync-only" });
 		expect(session.supportsCrashRecoverableReceipts()).toBe(false);
 		// The journal seam fails closed and the Session falls back to a
@@ -612,5 +646,180 @@ describe("JSONL framed journal crash-safety (iris_agent#51)", () => {
 		expect(tornDiagnostics[0]!).toContain("torn_tail");
 		expect(tornDiagnostics[0]!).toContain("line 3");
 		await tornRepo[Symbol.asyncDispose]();
+	});
+
+	it("iris_agent#61: quarantine after a missing-newline tail never concatenates onto the complete frame", async () => {
+		const root = createTempDir();
+		const fs = new NodeExecutionEnv({ cwd: root });
+		const repo = new JsonlSessionRepository({ fs, sessionsRoot: root });
+		const session = await repo.create({ cwd: root, id: "quarantine-newline" });
+		const metadata = await session.getMetadata();
+
+		const first = createUserMessage("first pair");
+		const second = createUserMessage("second pair");
+		const hash1 = await computeMessageContentHash(first);
+		const hash2 = await computeMessageContentHash(second);
+		const { entryId: entryId1 } = await session.appendMessageWithCommitReceipt(first, (id) => receiptFor(id, hash1));
+		const { entryId: entryId2 } = await session.appendMessageWithCommitReceipt(second, (id) => receiptFor(id, hash2));
+		const sessionPath = metadata.path;
+		await repo[Symbol.asyncDispose]();
+
+		// A complete final frame whose file does not end with "\n" is legal and
+		// fully recoverable — remove ONLY the final newline (the quarantine
+		// scenario from iris_agent#61).
+		const full = readFileSync(sessionPath, "utf8");
+		writeFileSync(sessionPath, full.slice(0, full.length - 1));
+
+		// Reopen parses the complete frame and exposes its pending receipt.
+		{
+			const { session: reopened, repo: reopenedRepo } = await openSessionFile(sessionPath);
+			expect((await reopened.getEntries()).length).toBe(2);
+			expect((await reopened.readPendingCommitReceipts()).length).toBe(2);
+			expect(await reopened.journalDiagnostics()).toEqual([]);
+
+			// Quarantine the SECOND receipt. The marker must land on its own
+			// line: the append guard emits the missing newline first.
+			await reopened.quarantineCommitReceipt(entryId2, "integrity_mismatch_test");
+			const afterQuarantine = readFileSync(sessionPath, "utf8");
+			expect(afterQuarantine).toContain(`"entryId":"${entryId2}"`);
+			expect(afterQuarantine).toMatch(/}\n{"__piReceiptQuarantine"/);
+			expect(afterQuarantine.endsWith("\n")).toBe(true);
+			await reopenedRepo[Symbol.asyncDispose]();
+		}
+
+		// Reopen after quarantine: BOTH committed entries survive, the
+		// quarantined receipt is exposed with its typed reason, the first
+		// receipt stays pending — nothing was truncated.
+		{
+			const { session: reopened, repo: reopenedRepo } = await openSessionFile(sessionPath);
+			expect((await reopened.getEntries()).length).toBe(2);
+			const pending = await reopened.readPendingCommitReceipts();
+			expect(pending.length).toBe(1);
+			expect(pending[0]!.entryId).toBe(entryId1);
+			const quarantined = await reopened.readQuarantinedCommitReceipts();
+			expect(quarantined.length).toBe(1);
+			expect(quarantined[0]!.entryId).toBe(entryId2);
+			expect(quarantined[0]!.reason).toBe("integrity_mismatch_test");
+			expect(await reopened.journalDiagnostics()).toEqual([]);
+			await reopenedRepo[Symbol.asyncDispose]();
+		}
+
+		// Idempotency: a repeated quarantine pass cannot grow malformed tails
+		// and cannot corrupt the earlier complete frames. Re-quarantining an
+		// already-quarantined entry appends another complete marker line (the
+		// loader orders by file position); the tail stays a valid JSON line.
+		{
+			const { session: reopened, repo: reopenedRepo } = await openSessionFile(sessionPath);
+			await reopened.quarantineCommitReceipt(entryId1, "second_pass_test");
+			const afterRepeated = readFileSync(sessionPath, "utf8");
+			const tailLine = afterRepeated.trimEnd().split("\n").at(-1)!;
+			expect(JSON.parse(tailLine)).toMatchObject({
+				__piReceiptQuarantine: true,
+				entryId: entryId1,
+			});
+			expect((await reopened.getEntries()).length).toBe(2);
+			const quarantined = await reopened.readQuarantinedCommitReceipts();
+			expect(quarantined.length).toBe(2);
+			expect(quarantined.map((q) => q.entryId)).toEqual([entryId2, entryId1]);
+			await reopenedRepo[Symbol.asyncDispose]();
+		}
+	});
+
+	it("iris_agent#61: CJK tails stay lossless through quarantine with no final newline", async () => {
+		const root = createTempDir();
+		const fs = new NodeExecutionEnv({ cwd: root });
+		const repo = new JsonlSessionRepository({ fs, sessionsRoot: root });
+		const session = await repo.create({ cwd: root, id: "quarantine-cjk" });
+		const metadata = await session.getMetadata();
+
+		const first = createUserMessage("你好，世界 — 第一对");
+		const second = createUserMessage("第二对：标记文本 __piReceiptQuarantine 在正文里");
+		const hash1 = await computeMessageContentHash(first);
+		const hash2 = await computeMessageContentHash(second);
+		await session.appendMessageWithCommitReceipt(first, (id) => receiptFor(id, hash1));
+		const { entryId: entryId2 } = await session.appendMessageWithCommitReceipt(second, (id) => receiptFor(id, hash2));
+		const sessionPath = metadata.path;
+		await repo[Symbol.asyncDispose]();
+
+		const full = readFileSync(sessionPath, "utf8");
+		writeFileSync(sessionPath, full.slice(0, full.length - 1));
+
+		const { session: reopened, repo: reopenedRepo } = await openSessionFile(sessionPath);
+		expect((await reopened.getEntries()).length).toBe(2);
+		const pending = await reopened.readPendingCommitReceipts();
+		expect(pending.length).toBe(2);
+		expect(pending.map((r) => r.entrySeq)).toEqual([1, 2]);
+
+		await reopened.quarantineCommitReceipt(entryId2, "cjk_quarantine_test");
+		const afterQuarantine = readFileSync(sessionPath, "utf8");
+		expect(afterQuarantine).toMatch(/}\n{"__piReceiptQuarantine"/);
+
+		// Reopen: both entries intact with original CJK text, one pending, one
+		// quarantined.
+		{
+			const { session: re2, repo: re2Repo } = await openSessionFile(sessionPath);
+			const entries = await re2.getEntries();
+			expect(entries.length).toBe(2);
+			const text1 = (entries[0]! as { message: { content: Array<{ text: string }> } }).message.content[0]!.text;
+			const text2 = (entries[1]! as { message: { content: Array<{ text: string }> } }).message.content[0]!.text;
+			expect(text1).toBe("你好，世界 — 第一对");
+			expect(text2).toBe("第二对：标记文本 __piReceiptQuarantine 在正文里");
+			const quarantined = await re2.readQuarantinedCommitReceipts();
+			expect(quarantined.length).toBe(1);
+			expect(quarantined[0]!.reason).toBe("cjk_quarantine_test");
+			await re2Repo[Symbol.asyncDispose]();
+		}
+		await reopenedRepo[Symbol.asyncDispose]();
+	});
+
+	it("iris_agent#61: torn quarantine-marker tail recovers without losing any earlier complete frame", async () => {
+		const root = createTempDir();
+		const fs = new NodeExecutionEnv({ cwd: root });
+		const repo = new JsonlSessionRepository({ fs, sessionsRoot: root });
+		const session = await repo.create({
+			cwd: root,
+			id: "torn-quarantine-marker",
+		});
+		const metadata = await session.getMetadata();
+
+		const first = createUserMessage("pair one");
+		const second = createUserMessage("pair two");
+		const hash1 = await computeMessageContentHash(first);
+		const hash2 = await computeMessageContentHash(second);
+		const { entryId: entryId1 } = await session.appendMessageWithCommitReceipt(first, (id) => receiptFor(id, hash1));
+		const { entryId: entryId2 } = await session.appendMessageWithCommitReceipt(second, (id) => receiptFor(id, hash2));
+		const sessionPath = metadata.path;
+		await repo[Symbol.asyncDispose]();
+
+		// Quarantine normally (file ends with newline — the guard is a no-op),
+		// then simulate a crash that truncates the quarantine marker itself.
+		const { session: reopened, repo: reopenedRepo } = await openSessionFile(sessionPath);
+		await reopened.quarantineCommitReceipt(entryId2, "torn_marker_test");
+		await reopenedRepo[Symbol.asyncDispose]();
+
+		const full = readFileSync(sessionPath, "utf8");
+		const markerStart = full.indexOf('"__piReceiptQuarantine"');
+		writeFileSync(sessionPath, full.slice(0, markerStart + 30));
+
+		// Reopen: the torn marker is quarantined as a torn tail; BOTH complete
+		// frames survive, and the torn quarantine marker's effect is undone —
+		// the second receipt is pending again (recovery re-quarantines it
+		// deterministically; never lost, never truncated).
+		const { session: re2, repo: re2Repo } = await openSessionFile(sessionPath);
+		expect((await re2.getEntries()).length).toBe(2);
+		const pending = await re2.readPendingCommitReceipts();
+		expect(pending.map((r) => r.entryId)).toEqual([entryId1, entryId2]);
+		const diagnostics = await re2.journalDiagnostics();
+		expect(diagnostics.length).toBe(1);
+		expect(diagnostics[0]!).toContain("torn_tail");
+
+		// Recovery then re-quarantines entry2 cleanly (idempotent): the file
+		// tail stays a valid marker line and both frames remain intact.
+		await re2.quarantineCommitReceipt(entryId2, "torn_marker_test");
+		const repaired = readFileSync(sessionPath, "utf8");
+		expect(repaired.trimEnd().split("\n").at(-1)).toContain("__piReceiptQuarantine");
+		expect((await re2.getEntries()).length).toBe(2);
+		expect((await re2.readPendingCommitReceipts()).map((r) => r.entryId)).toEqual([entryId1]);
+		await re2Repo[Symbol.asyncDispose]();
 	});
 });
