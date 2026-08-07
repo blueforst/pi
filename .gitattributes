@@ -9,6 +9,9 @@
 # Shell scripts should keep LF
 *.sh text eol=lf
 
+# Temporary merge aid for pi#15: preserve both independently appended crash-test blocks.
+packages/agent/test/harness/jsonl-journal-crash.test.ts merge=union
+
 # Common binary assets
 *.png binary
 *.jpg binary
