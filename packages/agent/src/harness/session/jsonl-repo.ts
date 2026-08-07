@@ -233,6 +233,12 @@ async function loadJsonlSession(fs: JsonlSessionFileSystem, path: string): Promi
 				if (quarantineTail("legacy receipt marker is missing its receipt")) continue;
 				throw invalidEntry(path, lineNumber, "legacy receipt marker is missing its receipt");
 			}
+			// iris_agent#60: ONE monotonic commit-order domain across legacy
+			// and framed records. The physical line number IS the commit order
+			// in an append-only journal; framed seq is a per-frame counter that
+			// restarts after an upgrade and is NOT comparable to legacy
+			// positions. Sorting both by lineNumber keeps the mixed file in
+			// exact physical commit order across reopen/restart.
 			pendingReceipts.push({ receipt, order: lineNumber });
 			continue;
 		}
@@ -290,7 +296,14 @@ async function loadJsonlSession(fs: JsonlSessionFileSystem, path: string): Promi
 				if (entryIds.has(frame.entry.id)) throw invalidSession(path, `duplicate entry id ${frame.entry.id}`);
 				entryIds.add(frame.entry.id);
 				entries.push(frame.entry);
-				pendingReceipts.push({ receipt: { ...frame.receipt, entrySeq: frame.seq }, order: frame.seq });
+				// iris_agent#60: framed receipts sort in the SAME commit-order
+				// domain as legacy markers — physical line number. frame.seq is a
+				// journal-local counter that can restart after a legacy->framed
+				// upgrade (maxJournalSeq derives only from framed records); using
+				// it as the sort key would let a fresh post-upgrade frame sort
+				// BEFORE an older pending legacy receipt written earlier in the
+				// file, violating authoritative lifecycle ordering.
+				pendingReceipts.push({ receipt: { ...frame.receipt, entrySeq: frame.seq }, order: lineNumber });
 				maxJournalSeq = Math.max(maxJournalSeq, frame.seq);
 			}
 			continue;
@@ -467,7 +480,12 @@ async function parseJournalFrame(
 interface JsonlSessionLoadResult {
 	metadata: JsonlSessionMetadata;
 	entries: SessionTreeEntry[];
-	/** Pending receipts in commit order, with the journal seq when known. */
+	/**
+	 * Pending receipts in commit order. iris_agent#60: `order` is ALWAYS the
+	 * physical line number — one monotonic commit-order domain shared by
+	 * legacy markers and framed records (framed seq can restart after a
+	 * legacy->framed upgrade and is not comparable to legacy positions).
+	 */
 	pendingReceipts: { receipt: SessionCommitReceipt; order: number }[];
 	/** Quarantined receipts (iris_agent#50) in file order, with typed reasons. */
 	quarantinedReceipts: { receipt: QuarantinedCommitReceipt; order: number }[];
@@ -851,6 +869,12 @@ export class JsonlSessionBackend {
 	 * (iris_agent#50: authoritative seq order; timestamps are diagnostics).
 	 * Re-reads the file so ack markers appended since the last load are
 	 * reflected; frames are validated structurally and by checksum.
+	 *
+	 * iris_agent#60: the commit-order key is the physical line number for
+	 * BOTH legacy markers and framed records (one monotonic domain across
+	 * the legacy->framed upgrade). A framed frame whose seq restarted at 1
+	 * after the upgrade can never sort before an older pending legacy
+	 * receipt that was durably committed earlier in the file.
 	 */
 	private async readPendingCommitReceipts(metadata: JsonlSessionMetadata): Promise<readonly SessionCommitReceipt[]> {
 		this.assertOpen();

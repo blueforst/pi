@@ -26,7 +26,9 @@ function makeNoSyncFs(root: string): NodeExecutionEnv {
 	// NodeExecutionEnv always supports syncFile; shadow the method with
 	// `undefined` at runtime so the backend's capability probe
 	// (`fs.syncFile === undefined`) sees none.
-	const env = new NodeExecutionEnv({ cwd: root }) as unknown as { syncFile?: unknown };
+	const env = new NodeExecutionEnv({ cwd: root }) as unknown as {
+		syncFile?: unknown;
+	};
 	Object.defineProperty(env, "syncFile", { value: undefined, writable: true });
 	return env as unknown as NodeExecutionEnv;
 }
@@ -58,8 +60,14 @@ describe("JSONL framed journal crash-safety (iris_agent#51)", () => {
 
 		const noSyncRoot = createTempDir();
 		const noSyncFs = makeNoSyncFs(noSyncRoot);
-		const noSyncRepo = new JsonlSessionRepository({ fs: noSyncFs, sessionsRoot: noSyncRoot });
-		const noSyncSession = await noSyncRepo.create({ cwd: noSyncRoot, id: "cap-2" });
+		const noSyncRepo = new JsonlSessionRepository({
+			fs: noSyncFs,
+			sessionsRoot: noSyncRoot,
+		});
+		const noSyncSession = await noSyncRepo.create({
+			cwd: noSyncRoot,
+			id: "cap-2",
+		});
 		expect(noSyncSession.supportsCrashRecoverableReceipts()).toBe(false);
 		await noSyncRepo[Symbol.asyncDispose]();
 		await repo[Symbol.asyncDispose]();
@@ -68,13 +76,22 @@ describe("JSONL framed journal crash-safety (iris_agent#51)", () => {
 	it("fails closed on the journal seam when the filesystem cannot fsync", async () => {
 		const root = createTempDir();
 		const noSyncFs = makeNoSyncFs(root);
-		const backend = new JsonlSessionBackend({ fs: noSyncFs, sessionsRoot: root });
+		const backend = new JsonlSessionBackend({
+			fs: noSyncFs,
+			sessionsRoot: root,
+		});
 		const storage = await backend.create({ cwd: root, id: "no-fsync-1" });
 		const message = createUserMessage("crash window");
 		const contentHash = await computeMessageContentHash(message);
 		await expect(
 			storage.appendEntryWithReceipt!(
-				{ id: "e1", parentId: null, timestamp: new Date().toISOString(), type: "message", message },
+				{
+					id: "e1",
+					parentId: null,
+					timestamp: new Date().toISOString(),
+					type: "message",
+					message,
+				},
 				receiptFor("e1", contentHash),
 			),
 		).rejects.toThrow(/syncFile/);
@@ -84,7 +101,10 @@ describe("JSONL framed journal crash-safety (iris_agent#51)", () => {
 	it("falls back to a plain append (publish-only receipts) on an fsync-less backend instead of pretending durability", async () => {
 		const root = createTempDir();
 		const noSyncFs = makeNoSyncFs(root);
-		const repo = new JsonlSessionRepository({ fs: noSyncFs, sessionsRoot: root });
+		const repo = new JsonlSessionRepository({
+			fs: noSyncFs,
+			sessionsRoot: root,
+		});
 		const session = await repo.create({ cwd: root, id: "no-fsync-2" });
 		const metadata = await session.getMetadata();
 		const message = createUserMessage("plain append on fsync-less fs");
@@ -178,7 +198,10 @@ describe("JSONL framed journal crash-safety (iris_agent#51)", () => {
 		const flipped1 = frame1.replace(/(?<=checksum":")[0-9a-f]/, (c) => (c === "0" ? "1" : "0"));
 		writeFileSync(join(tmpMid, "s.jsonl"), `${lines[0]}\n${flipped1}\n${lines[2]}\n`);
 		const midFs = new NodeExecutionEnv({ cwd: tmpMid });
-		const midRepo = new JsonlSessionRepository({ fs: midFs, sessionsRoot: tmpMid });
+		const midRepo = new JsonlSessionRepository({
+			fs: midFs,
+			sessionsRoot: tmpMid,
+		});
 		const midMetadata = await loadJsonlSessionMetadata(midFs, join(tmpMid, "s.jsonl"));
 		await expect(midRepo.open(midMetadata)).rejects.toThrow(/checksum mismatch|not valid JSON/);
 		await midRepo[Symbol.asyncDispose]();
@@ -447,8 +470,11 @@ describe("JSONL framed journal crash-safety (iris_agent#51)", () => {
 		{
 			const { session: reopened, repo: reopenedRepo } = await openSessionFile(sessionPath);
 			expect((await reopened.getEntries()).length).toBe(2);
-			const text = ((await reopened.getEntries())[0] as { message: { content: Array<{ text: string }> } }).message
-				.content[0]!.text;
+			const text = (
+				(await reopened.getEntries())[0] as {
+					message: { content: Array<{ text: string }> };
+				}
+			).message.content[0]!.text;
 			expect(text).toBe("第一帧：中文内容 unicode 多字节，必须毫发无损");
 			expect(await reopened.journalDiagnostics()).toEqual([]);
 			await reopenedRepo[Symbol.asyncDispose]();
@@ -494,11 +520,19 @@ describe("JSONL framed journal crash-safety (iris_agent#51)", () => {
 
 	it("capability requires BOTH fsync and truncate: syncFile without truncateFile is not crash-recoverable", async () => {
 		const root = createTempDir();
-		const env = new NodeExecutionEnv({ cwd: root }) as unknown as { truncateFile?: unknown };
+		const env = new NodeExecutionEnv({ cwd: root }) as unknown as {
+			truncateFile?: unknown;
+		};
 		// Shadow the prototype method with `undefined` (delete does not
 		// remove inherited properties).
-		Object.defineProperty(env, "truncateFile", { value: undefined, writable: true });
-		const repo = new JsonlSessionRepository({ fs: env as unknown as NodeExecutionEnv, sessionsRoot: root });
+		Object.defineProperty(env, "truncateFile", {
+			value: undefined,
+			writable: true,
+		});
+		const repo = new JsonlSessionRepository({
+			fs: env as unknown as NodeExecutionEnv,
+			sessionsRoot: root,
+		});
 		const session = await repo.create({ cwd: root, id: "cap-sync-only" });
 		expect(session.supportsCrashRecoverableReceipts()).toBe(false);
 		// The journal seam fails closed and the Session falls back to a
@@ -612,5 +646,239 @@ describe("JSONL framed journal crash-safety (iris_agent#51)", () => {
 		expect(tornDiagnostics[0]!).toContain("torn_tail");
 		expect(tornDiagnostics[0]!).toContain("line 3");
 		await tornRepo[Symbol.asyncDispose]();
+	});
+
+	it("iris_agent#60: mixed legacy+framed receipts replay in exact physical commit order, never by incomparable order domains", async () => {
+		const root = createTempDir();
+		const header = JSON.stringify({
+			type: "session",
+			version: 3,
+			id: "mixed-order-1",
+			timestamp: "2026-08-01T00:00:00.000Z",
+			cwd: root,
+		});
+		// Legacy part: bare entry + legacy receipt marker (no journal seq).
+		const legacyEntry = JSON.stringify({
+			id: "e-legacy-a",
+			parentId: null,
+			timestamp: "2026-08-01T00:00:01.000Z",
+			type: "message",
+			message: createUserMessage("legacy committed first"),
+		});
+		const legacyReceipt = receiptFor("e-legacy-a", "deadbeef".repeat(8));
+		const legacyMarker = JSON.stringify({
+			__piReceipt: true,
+			receipt: legacyReceipt,
+		});
+
+		// Framed part: a REAL journal frame via the backend, so the frame line
+		// (seq, checksum) is exactly what production writes.
+		const frameRoot = createTempDir();
+		const frameFs = new NodeExecutionEnv({ cwd: frameRoot });
+		const frameRepo = new JsonlSessionRepository({
+			fs: frameFs,
+			sessionsRoot: frameRoot,
+		});
+		const frameSession = await frameRepo.create({
+			cwd: frameRoot,
+			id: "frame-source",
+		});
+		const frameMessage = createUserMessage("framed committed second");
+		const frameHash = await computeMessageContentHash(frameMessage);
+		const { entryId: framedEntryId } = await frameSession.appendMessageWithCommitReceipt(frameMessage, (id) =>
+			receiptFor(id, frameHash),
+		);
+		const frameLine = readFileSync((await frameSession.getMetadata()).path, "utf8").split("\n")[1]!;
+		await frameRepo[Symbol.asyncDispose]();
+
+		// The issue's exact file shape: legacy marker at line 3, framed frame at
+		// line 4 with seq=1. Legacy order=3, framed old-order=1 — the old sort
+		// put the NEWER frame first, violating physical commit order.
+		const mixedPath = join(root, "mixed.jsonl");
+		writeFileSync(mixedPath, `${header}\n${legacyEntry}\n${legacyMarker}\n${frameLine}\n`);
+
+		const { session: reopened, repo: reopenedRepo } = await openSessionFile(mixedPath);
+		const pending = await reopened.readPendingCommitReceipts();
+		expect(pending.length).toBe(2);
+		// Physical commit order: legacy A first, framed B second — despite the
+		// framed seq restarting at 1.
+		expect(pending.map((r) => r.entryId)).toEqual(["e-legacy-a", framedEntryId]);
+		expect(pending[0]!.entrySeq).toBeUndefined();
+		expect(pending[1]!.entrySeq).toBe(1);
+		// Both entries are present in file order.
+		const entries = await reopened.getEntries();
+		expect(entries.map((e) => e.id)).toEqual(["e-legacy-a", framedEntryId]);
+
+		// Ack the legacy receipt: only the framed receipt remains pending, and
+		// it must not reorder against anything else.
+		await reopened.ackCommitReceipt("e-legacy-a");
+		expect((await reopened.readPendingCommitReceipts()).map((r) => r.entryId)).toEqual([framedEntryId]);
+		await reopenedRepo[Symbol.asyncDispose]();
+	});
+
+	it("iris_agent#60: the first post-upgrade frame cannot sort before older pending legacy receipts (reopen-stable)", async () => {
+		const root = createTempDir();
+		const header = JSON.stringify({
+			type: "session",
+			version: 3,
+			id: "upgrade-order-1",
+			timestamp: "2026-08-01T00:00:00.000Z",
+			cwd: root,
+		});
+		// A legacy journal with TWO pending receipts (lines 3 and 5), then the
+		// upgrade appends the first framed pair (seq=1).
+		const entryA = JSON.stringify({
+			id: "e-up-a",
+			parentId: null,
+			timestamp: "2026-08-01T00:00:01.000Z",
+			type: "message",
+			message: createUserMessage("legacy a"),
+		});
+		const entryB = JSON.stringify({
+			id: "e-up-b",
+			parentId: null,
+			timestamp: "2026-08-01T00:00:02.000Z",
+			type: "message",
+			message: createUserMessage("legacy b"),
+		});
+		const markerA = JSON.stringify({
+			__piReceipt: true,
+			receipt: receiptFor("e-up-a", "a".repeat(64)),
+		});
+		const markerB = JSON.stringify({
+			__piReceipt: true,
+			receipt: receiptFor("e-up-b", "b".repeat(64)),
+		});
+		const legacyPath = join(root, "upgrade.jsonl");
+		writeFileSync(legacyPath, `${header}\n${entryA}\n${markerA}\n${entryB}\n${markerB}\n`);
+
+		// Open the legacy journal and append the first FRAMED pair: the backend
+		// seeds seq=1 (maxJournalSeq is 0 — no framed records yet).
+		{
+			const { session: reopened, repo: reopenedRepo } = await openSessionFile(legacyPath);
+			const framed = createUserMessage("first framed after upgrade");
+			const framedHash = await computeMessageContentHash(framed);
+			const { entryId: framedEntryId } = await reopened.appendMessageWithCommitReceipt(framed, (id) =>
+				receiptFor(id, framedHash),
+			);
+			// Order: the new frame (seq=1) MUST sort after BOTH older pending
+			// legacy receipts — physical commit order wins over the restarting
+			// seq counter.
+			const pending = await reopened.readPendingCommitReceipts();
+			expect(pending.map((r) => r.entryId)).toEqual(["e-up-a", "e-up-b", framedEntryId]);
+			expect(pending[2]!.entrySeq).toBe(1);
+			// The next framed append must continue monotonic (seq=2), not
+			// restart, and stay last.
+			const second = createUserMessage("second framed after upgrade");
+			const secondHash = await computeMessageContentHash(second);
+			const { entryId: framedEntryId2 } = await reopened.appendMessageWithCommitReceipt(second, (id) =>
+				receiptFor(id, secondHash),
+			);
+			expect((await reopened.readPendingCommitReceipts()).map((r) => r.entryId)).toEqual([
+				"e-up-a",
+				"e-up-b",
+				framedEntryId,
+				framedEntryId2,
+			]);
+			const pending2 = await reopened.readPendingCommitReceipts();
+			expect(pending2[3]!.entrySeq).toBe(2);
+			await reopenedRepo[Symbol.asyncDispose]();
+		}
+
+		// Reopen/restart: the same deterministic order, exactly-once replay.
+		{
+			const { session: reopened, repo: reopenedRepo } = await openSessionFile(legacyPath);
+			const pending = await reopened.readPendingCommitReceipts();
+			expect(pending.map((r) => r.entrySeq ?? null)).toEqual([null, null, 1, 2]);
+			expect(await reopened.journalDiagnostics()).toEqual([]);
+			await reopenedRepo[Symbol.asyncDispose]();
+		}
+	});
+
+	it("iris_agent#60: quarantine markers and torn-tail repair stay correct in a mixed legacy+framed file with CJK content", async () => {
+		const root = createTempDir();
+		const header = JSON.stringify({
+			type: "session",
+			version: 3,
+			id: "mixed-cjk",
+			timestamp: "2026-08-01T00:00:00.000Z",
+			cwd: root,
+		});
+		const legacyEntry = JSON.stringify({
+			id: "e-cjk-legacy",
+			parentId: null,
+			timestamp: "2026-08-01T00:00:01.000Z",
+			type: "message",
+			message: createUserMessage("旧消息正文：标记文本 __piReceipt 在正文里"),
+		});
+		const legacyMarker = JSON.stringify({
+			__piReceipt: true,
+			receipt: receiptFor("e-cjk-legacy", "c".repeat(64)),
+		});
+
+		// Real framed frame with CJK payload.
+		const frameRoot = createTempDir();
+		const frameFs = new NodeExecutionEnv({ cwd: frameRoot });
+		const frameRepo = new JsonlSessionRepository({
+			fs: frameFs,
+			sessionsRoot: frameRoot,
+		});
+		const frameSession = await frameRepo.create({
+			cwd: frameRoot,
+			id: "frame-cjk",
+		});
+		const frameMessage = createUserMessage("新帧正文：你好，世界 __piReceiptQuarantine 混排测试");
+		const frameHash = await computeMessageContentHash(frameMessage);
+		const { entryId: framedEntryId } = await frameSession.appendMessageWithCommitReceipt(frameMessage, (id) =>
+			receiptFor(id, frameHash),
+		);
+		const frameLine = readFileSync((await frameSession.getMetadata()).path, "utf8").split("\n")[1]!;
+		await frameRepo[Symbol.asyncDispose]();
+
+		const mixedPath = join(root, "mixed-cjk.jsonl");
+		writeFileSync(mixedPath, `${header}\n${legacyEntry}\n${legacyMarker}\n${frameLine}\n`);
+
+		// Load, quarantine the FRAMED receipt (integrity failure path), reopen.
+		{
+			const { session: reopened, repo: reopenedRepo } = await openSessionFile(mixedPath);
+			const pending = await reopened.readPendingCommitReceipts();
+			expect(pending.map((r) => r.entryId)).toEqual(["e-cjk-legacy", framedEntryId]);
+			await reopened.quarantineCommitReceipt(framedEntryId, "integrity_mismatch_cjk");
+			await reopenedRepo[Symbol.asyncDispose]();
+		}
+		{
+			const { session: reopened, repo: reopenedRepo } = await openSessionFile(mixedPath);
+			// Legacy pending survives; framed receipt quarantined; both entries
+			// intact with the original CJK text.
+			expect((await reopened.readPendingCommitReceipts()).map((r) => r.entryId)).toEqual(["e-cjk-legacy"]);
+			const quarantined = await reopened.readQuarantinedCommitReceipts();
+			expect(quarantined.map((q) => q.entryId)).toEqual([framedEntryId]);
+			expect(quarantined[0]!.reason).toBe("integrity_mismatch_cjk");
+			const entries = await reopened.getEntries();
+			expect(entries.length).toBe(2);
+			const text0 = (entries[0]! as { message: { content: Array<{ text: string }> } }).message.content[0]!.text;
+			const text1 = (entries[1]! as { message: { content: Array<{ text: string }> } }).message.content[0]!.text;
+			expect(text0).toBe("旧消息正文：标记文本 __piReceipt 在正文里");
+			expect(text1).toBe("新帧正文：你好，世界 __piReceiptQuarantine 混排测试");
+			await reopenedRepo[Symbol.asyncDispose]();
+		}
+
+		// Torn-tail repair on the mixed file: append a torn line, reopen —
+		// repair truncates only the torn tail, the earlier legacy+framed order
+		// is unchanged.
+		{
+			// Simulate a torn append by appending a partial line directly.
+			const fs = new NodeExecutionEnv({ cwd: root });
+			await fs.appendFile(mixedPath, '{"__piReceiptAck": true, "entryId": "');
+		}
+		{
+			const { session: reopened, repo: reopenedRepo } = await openSessionFile(mixedPath);
+			expect((await reopened.readPendingCommitReceipts()).map((r) => r.entryId)).toEqual(["e-cjk-legacy"]);
+			const diagnostics = await reopened.journalDiagnostics();
+			expect(diagnostics.length).toBeGreaterThan(0);
+			expect(diagnostics[0]!).toContain("torn_tail");
+			expect((await reopened.getEntries()).length).toBe(2);
+			await reopenedRepo[Symbol.asyncDispose]();
+		}
 	});
 });
