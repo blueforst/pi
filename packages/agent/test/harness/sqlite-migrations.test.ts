@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -6,7 +7,7 @@ import {
 	applyMigrations,
 	createNodeSqliteFactory,
 	loadMigrations,
-	releasedMigrationChecksums,
+	loadReleaseManifest,
 	type SqliteDatabase,
 	type SqliteDatabaseFactory,
 	type SqliteRunResult,
@@ -14,6 +15,7 @@ import {
 	SqliteSessionRepository,
 	type SqliteStatement,
 } from "../../../storage/sqlite-node/src/index.ts";
+import type { SqliteMigration } from "../../../storage/sqlite-node/src/sqlite/migrations.ts";
 import { SqliteSessionConnection } from "../../../storage/sqlite-node/src/sqlite/storage/index.ts";
 import { NodeExecutionEnv } from "../../src/harness/env/nodejs.ts";
 import { createAssistantMessage, createUserMessage } from "./session-test-utils.ts";
@@ -272,17 +274,19 @@ describe("SQLite migrations", () => {
 	});
 
 	it("iris_agent#67: every released migration has a manifest checksum matching the packaged SQL (release-owned gate)", async () => {
-		const manifest = releasedMigrationChecksums();
+		const manifest = await loadReleaseManifest();
 		const migrations = await loadMigrations();
-		// Every packaged migration must be pinned in the release manifest.
-		expect(Object.keys(manifest).sort()).toEqual(migrations.map((m) => m.id).sort());
+		// Every packaged migration must be pinned in the release manifest —
+		// same ids, same RELEASE ORDER (a reordered manifest/package pair
+		// would silently apply a different sequence on a fresh database).
+		expect(manifest.map((entry) => entry.id)).toEqual(migrations.map((migration) => migration.id));
 		// The pinned checksums must equal the sha256 of the packaged SQL — if a
 		// released migration file is edited without updating the manifest, this
 		// fails closed at the source.
 		for (const migration of migrations) {
-			expect(manifest[migration.id], migration.id).toBe(
-				require("node:crypto").createHash("sha256").update(migration.sql).digest("hex"),
-			);
+			const entry = manifest.find((candidate) => candidate.id === migration.id);
+			expect(entry, migration.id).toBeDefined();
+			expect(entry?.sha256, migration.id).toBe(createHash("sha256").update(migration.sql).digest("hex"));
 		}
 	});
 
@@ -308,9 +312,10 @@ describe("SQLite migrations", () => {
 			const rows = await db
 				.prepare("SELECT id, checksum FROM migrations ORDER BY id")
 				.all<{ id: string; checksum: string }>();
-			const manifest = releasedMigrationChecksums();
+			const manifest = await loadReleaseManifest();
+			const byId = new Map(manifest.map((entry) => [entry.id, entry.sha256]));
 			for (const row of rows) {
-				expect(row.checksum, row.id).toBe(manifest[row.id]);
+				expect(row.checksum, row.id).toBe(byId.get(row.id));
 			}
 		} finally {
 			await db.close();
@@ -375,6 +380,234 @@ describe("SQLite migrations", () => {
 			// that may be newer than the checkout.
 			await expect(applyMigrations(db)).rejects.toThrow(/999_unknown_future.sql/);
 			await expect(applyMigrations(db)).rejects.toThrow(/fail closed/);
+		} finally {
+			await db.close();
+		}
+	});
+
+	// iris_agent#78: helper — build a pre-checksum-era database with the
+	// first `count` migrations applied (migrations table WITHOUT a checksum
+	// column, as every database shipped before the checksum feature).
+	async function createPreChecksumDatabase(
+		db: SqliteDatabase,
+		migrations: SqliteMigration[],
+		count: number,
+	): Promise<void> {
+		await db.exec("CREATE TABLE migrations (id TEXT PRIMARY KEY, applied_at TEXT NOT NULL)");
+		for (let i = 0; i < count; i++) {
+			await db.exec(migrations[i].sql);
+			await db
+				.prepare("INSERT INTO migrations (id, applied_at) VALUES (?, ?)")
+				.run(migrations[i].id, new Date().toISOString());
+		}
+	}
+
+	it("iris_agent#78: clean initialization records the release-manifest checksum for every packaged migration", async () => {
+		const root = createTempDir();
+		const databasePath = join(root, "sessions.sqlite");
+		const sqlite = createNodeSqliteFactory();
+		const db = await sqlite.open(databasePath);
+		try {
+			await applyMigrations(db);
+			const rows = await db
+				.prepare("SELECT id, checksum FROM migrations ORDER BY id")
+				.all<{ id: string; checksum: string }>();
+			const manifest = await loadReleaseManifest();
+			const byId = new Map(manifest.map((entry) => [entry.id, entry.sha256]));
+			expect(rows.map((row) => row.id)).toEqual(manifest.map((entry) => entry.id));
+			for (const row of rows) {
+				expect(row.checksum, row.id).toBe(byId.get(row.id));
+			}
+		} finally {
+			await db.close();
+		}
+	});
+
+	it("iris_agent#78: EVERY pre-checksum legacy upgrade boundary backfills against the release manifest", async () => {
+		const migrations = await loadMigrations();
+		const manifest = await loadReleaseManifest();
+		const manifestById = new Map(manifest.map((entry) => [entry.id, entry.sha256]));
+		// Reference schema produced by a clean initialization.
+		const cleanRoot = createTempDir();
+		const cleanSqlite = createNodeSqliteFactory();
+		const cleanDb = await cleanSqlite.open(join(cleanRoot, "sessions.sqlite"));
+		let cleanTables: string[];
+		try {
+			await applyMigrations(cleanDb);
+			cleanTables = (
+				await cleanDb.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all<{ name: string }>()
+			)
+				.map((row) => row.name)
+				.sort();
+		} finally {
+			await cleanDb.close();
+		}
+		// Every supported pre-checksum boundary: a database created by any
+		// prefix of the released migrations (001-era, 001-002-era,
+		// 001-002-003-era, 001-002-003-004-era).
+		for (let boundary = 1; boundary < migrations.length; boundary++) {
+			const root = createTempDir();
+			const databasePath = join(root, "sessions.sqlite");
+			const sqlite = createNodeSqliteFactory();
+			const db = await sqlite.open(databasePath);
+			try {
+				await createPreChecksumDatabase(db, migrations, boundary);
+				await applyMigrations(db);
+				const rows = await db
+					.prepare("SELECT id, checksum FROM migrations ORDER BY id")
+					.all<{ id: string; checksum: string }>();
+				expect(
+					rows.map((row) => row.id),
+					`boundary ${boundary} applied set`,
+				).toEqual(manifest.map((entry) => entry.id));
+				for (const row of rows) {
+					expect(row.checksum, `boundary ${boundary}: ${row.id}`).toBe(manifestById.get(row.id));
+				}
+				// The upgrade produced the exact same schema as a clean init.
+				const tables = await db
+					.prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
+					.all<{ name: string }>();
+				expect(tables.map((row) => row.name).sort(), `boundary ${boundary} schema`).toEqual(cleanTables);
+			} finally {
+				await db.close();
+			}
+		}
+	});
+
+	it("iris_agent#78: a released migration missing from the packaged set fails closed before any application or backfill", async () => {
+		const migrations = await loadMigrations();
+		const withoutQuarantine = migrations.filter((migration) => migration.id !== "005_quarantine.sql");
+		// Fresh database: the failure must happen before ANY mutation — not
+		// even the migrations table is bootstrapped.
+		{
+			const root = createTempDir();
+			const databasePath = join(root, "sessions.sqlite");
+			const sqlite = createNodeSqliteFactory();
+			const db = await sqlite.open(databasePath);
+			try {
+				await expect(applyMigrations(db, { migrations: withoutQuarantine })).rejects.toThrow(
+					/005_quarantine\.sql.*missing from the packaged migration set/,
+				);
+				const table = await db
+					.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'migrations'")
+					.get();
+				expect(table).toBeUndefined();
+			} finally {
+				await db.close();
+			}
+		}
+		// Legacy database: the failure must happen before ANY backfill — the
+		// migrations table is not even altered to add the checksum column.
+		{
+			const root = createTempDir();
+			const databasePath = join(root, "sessions.sqlite");
+			const sqlite = createNodeSqliteFactory();
+			const db = await sqlite.open(databasePath);
+			try {
+				await createPreChecksumDatabase(db, migrations, 4);
+				await expect(applyMigrations(db, { migrations: withoutQuarantine })).rejects.toThrow(
+					/005_quarantine\.sql.*missing from the packaged migration set/,
+				);
+				const columns = await db.prepare("PRAGMA table_info(migrations)").all<{ name: string }>();
+				expect(columns.map((column) => column.name)).not.toContain("checksum");
+			} finally {
+				await db.close();
+			}
+		}
+	});
+
+	it("iris_agent#78: a reordered packaged migration set fails closed instead of silently applying a different sequence", async () => {
+		const migrations = await loadMigrations();
+		const reordered = [migrations[0], migrations[2], migrations[1], migrations[3], migrations[4]];
+		// Fresh database: nothing may be applied from a reordered package.
+		{
+			const root = createTempDir();
+			const databasePath = join(root, "sessions.sqlite");
+			const sqlite = createNodeSqliteFactory();
+			const db = await sqlite.open(databasePath);
+			try {
+				await expect(applyMigrations(db, { migrations: reordered })).rejects.toThrow(/out of release order/);
+				const table = await db
+					.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'migrations'")
+					.get();
+				expect(table).toBeUndefined();
+			} finally {
+				await db.close();
+			}
+		}
+		// Legacy database: no checksum backfill may happen from a reordered
+		// package either — the migrations table is not even altered.
+		{
+			const root = createTempDir();
+			const databasePath = join(root, "sessions.sqlite");
+			const sqlite = createNodeSqliteFactory();
+			const db = await sqlite.open(databasePath);
+			try {
+				await createPreChecksumDatabase(db, migrations, migrations.length);
+				await expect(applyMigrations(db, { migrations: reordered })).rejects.toThrow(/out of release order/);
+				const columns = await db.prepare("PRAGMA table_info(migrations)").all<{ name: string }>();
+				expect(columns.map((column) => column.name)).not.toContain("checksum");
+			} finally {
+				await db.close();
+			}
+		}
+	});
+
+	it("iris_agent#78: a packaged migration without a manifest entry interleaved with released migrations fails closed", async () => {
+		const migrations = await loadMigrations();
+		const interleaved = [
+			migrations[0],
+			{ ...migrations[1], id: "006_draft.sql", order: 6 },
+			migrations[2],
+			migrations[3],
+			migrations[4],
+		];
+		const root = createTempDir();
+		const databasePath = join(root, "sessions.sqlite");
+		const sqlite = createNodeSqliteFactory();
+		const db = await sqlite.open(databasePath);
+		try {
+			await expect(applyMigrations(db, { migrations: interleaved })).rejects.toThrow(/interleaved/);
+			const table = await db
+				.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'migrations'")
+				.get();
+			expect(table).toBeUndefined();
+		} finally {
+			await db.close();
+		}
+	});
+
+	it("iris_agent#78: a not-yet-released migration appended AFTER the released set applies and records its own checksum", async () => {
+		const migrations = [
+			...(await loadMigrations()),
+			{
+				id: "006_draft.sql",
+				order: 6,
+				sql: "-- draft migration under development\nCREATE TABLE IF NOT EXISTS draft_marker (id INTEGER PRIMARY KEY);\n",
+			},
+		];
+		const root = createTempDir();
+		const databasePath = join(root, "sessions.sqlite");
+		const sqlite = createNodeSqliteFactory();
+		const db = await sqlite.open(databasePath);
+		try {
+			await applyMigrations(db, { migrations });
+			const rows = await db
+				.prepare("SELECT id, checksum FROM migrations ORDER BY id")
+				.all<{ id: string; checksum: string }>();
+			expect(rows.map((row) => row.id)).toEqual([
+				"001_initial.sql",
+				"002_branch_tips.sql",
+				"003_commit_receipts.sql",
+				"004_receipt_seq.sql",
+				"005_quarantine.sql",
+				"006_draft.sql",
+			]);
+			const draft = rows.find((row) => row.id === "006_draft.sql");
+			expect(draft?.checksum).toBe(createHash("sha256").update(migrations[5].sql).digest("hex"));
+			expect(
+				await db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'draft_marker'").get(),
+			).toBeDefined();
 		} finally {
 			await db.close();
 		}
